@@ -29,9 +29,9 @@ SPI_HZ = 500_000
 FRAME_WORDS = 5     #each ADC frame has 5 words, each word is 24 bits (3 bytes)
 FRAME_BYTES = FRAME_WORDS * 3  # 5 x 24-bit words, each frame is 15 bytes
 
-# (250 samples per second per channel at 8.192 MHz). Gain register reset is 0 => gain 1 (no amplification), +/-1.2 V differential.
+# (1000 samples per second per channel at 8.192 MHz). Gain register reset is 0 => gain 1 (no amplification), +/-1.2 V differential.
 REG_CLOCK = 0x03                         #selects the clock and data rate settings for the ADC
-CLOCK_250_SPS = 0x071E                   #enable all 3 channels, high resolution mode, divide clock by 2, set oversampling ratio to 16384 for 250 samples per second
+CLOCK_1000_SPS = 0x0716                  #enable all 3 channels, high resolution mode, divide clock by 2, set oversampling ratio to 16384 for 1000 samples per second
 REG_DCDC_CTRL = 0x31                     #selects the DCDC converter frequency and enables it
 DCDC_FREQ_4P096_MHZ_AND_ENABLE = 0x0001  # DCDC_FREQ=0000b, DCDC_EN=1
 
@@ -127,8 +127,8 @@ def main() -> int:
         time.sleep(0.005)
 
         # Keep ADC's default gain=1 and all channels enabled
-        # data rate at 250 SPS so Python can poll status
-        spi.xfer2(wreg_frame(REG_CLOCK, CLOCK_250_SPS))
+        # data rate at 1000 SPS so Python can poll status
+        spi.xfer2(wreg_frame(REG_CLOCK, CLOCK_1000_SPS))
         # 8.192 MHz CLKIN / default divider 2 = 4.096 MHz MOD_CLK.
         # DCDC_FREQ=0000 selects the range containing 4.096 MHz; then enable.
         spi.xfer2(wreg_frame(REG_DCDC_CTRL, 0x0000))
@@ -259,8 +259,6 @@ def main() -> int:
                             f"CH2={volts[2]:+.4f} V"
                         )
                         last_print = now
-
-            time.sleep(0.001)
 
             
     # program shutdown and clean-up
