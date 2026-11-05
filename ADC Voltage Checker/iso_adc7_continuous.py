@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Basic ISO ADC 7 / AMC131M03 test for Raspberry Pi SPI0.
+"""ISO ADC 7 / AMC131M03 for Raspberry Pi SPI0.
 
 script reads the AMC131M03 STATUS word over SPI and polls its per-channel
-DRDY bits. 
+DRDY bits. Catches anolmalies in CH0/CH1 voltage relative to a baseline established at startup.
 """
 
 import sys
@@ -13,81 +13,86 @@ from gpiozero import DigitalOutputDevice
 #gpiozero lets the script to control the Pi's GPIO pins.
 
 # BCM numbers for gpiozero:
-# RST physical 18 -> BCM24; XEN physical 22 -> BCM25.
+# RST XEN physical pins 18 and 22
 SPI_BUS = 0
-SPI_DEVICE = 0  # CS physical 24 -> CE0 / BCM8
-RST_BCM = 24
-XEN_BCM = 25
+SPI_DEVICE = 0  # GPIO8, CS physical pin 24
+RST_BCM = 24    # GPIO 24, pin 18
+XEN_BCM = 25    # GPIO 25, pin 22
 
 # defaults to 24-bit words, SPI mode 1, and input CRC disabled.
 SPI_MODE = 0b01
 SPI_HZ = 500_000
-FRAME_WORDS = 5
-FRAME_BYTES = FRAME_WORDS * 3  # 5 x 24-bit words
+FRAME_WORDS = 5     #each ADC frame has 5 words, each word is 24 bits (3 bytes)
+FRAME_BYTES = FRAME_WORDS * 3  # 5 x 24-bit words, each frame is 15 bytes
 
-# Reset register values: enable all channels, HR mode, CLKIN/2, OSR=16384
-# (250 SPS at 8.192 MHz). Gain register reset is 0 => gain 1, +/-1.2 V.
-REG_CLOCK = 0x03
-CLOCK_250_SPS = 0x071E
-REG_DCDC_CTRL = 0x31
+# (250 samples per second per channel at 8.192 MHz). Gain register reset is 0 => gain 1 (no amplification), +/-1.2 V differential.
+REG_CLOCK = 0x03                         #selects the clock and data rate settings for the ADC
+CLOCK_250_SPS = 0x071E                   #enable all 3 channels, high resolution mode, divide clock by 2, set oversampling ratio to 16384 for 250 samples per second
+REG_DCDC_CTRL = 0x31                     #selects the DCDC converter frequency and enables it
 DCDC_FREQ_4P096_MHZ_AND_ENABLE = 0x0001  # DCDC_FREQ=0000b, DCDC_EN=1
 
-STATUS_SEC_FAIL = 1 << 6
-STATUS_READY_MASK = 0b111
+STATUS_SEC_FAIL = 1 << 6         #bit 6 of STATUS word indicates that the isolated-side supply is not valid
+STATUS_READY_MASK = 0b111        #bits 0-2 of STATUS word indicate the ready status of each channel (CH0, CH1, CH2)
 
 # With gain=1, the differential full-scale is +/-1.2 V.
-VOLTS_PER_CODE = 1.2 / (1 << 23)
+VOLTS_PER_CODE = 1.2 / (1 << 23) # 1.2 V / 2^23
 
 
+# functions converts ADC's SPI frame format and python ints.
+# SPI sends/receives bytes, ADC organizes into 24-bit words, and Python uses arbitrary-length ints.
 def word24(word16: int) -> list[int]:
-    # MSB-align a 16-bit command/register word in a 24-bit SPI word.
-    return [(word16 >> 8) & 0xFF, word16 & 0xFF, 0]
+    # packs 16-bit command/register word in a 24-bit SPI word. MSB first
+    return [(word16 >> 8) & 0xFF, word16 & 0xFF, 0]     
+    #final byte is 0 because the ADC expects 24-bit words, but the command is only 16 bits.
 
 
 def command_frame(command: int) -> list[int]:
-    # build five-word frame; input CRC disabled
+    # build five-word frame, puts command in first word. Adds zero padding; input CRC disabled
     return word24(command) + [0] * (3 * (FRAME_WORDS - 1))
 
 
 def wreg_frame(address: int, value: int) -> list[int]:
-    # build one-register WREG frame plus the required trailing words
+    # encodes one-register WREG frame plus required trailing words into command
     # WREG = 011 + 6-bit address + 7-bit count-minus-one.
     command = 0x6000 | ((address & 0x3F) << 7)
-    # One command word, one register-data word, then three words to complete
-    # the standard five-word frame (input CRC disabled).
+    # one command word, one register-data word, then three words to complete
+    # the standard five-word frame
     return word24(command) + word24(value) + [0] * (3 * 3)
 
 
 def signed24(data: list[int]) -> int:
+    # combines three received bytes into a signed 24-bit integer. MSB first.
+    # The ADC's output is in two's complement format, so if MSB is set, we subtract 2^24 to get the negative value.
     value = (data[0] << 16) | (data[1] << 8) | data[2]
     return value - (1 << 24) if value & 0x800000 else value
 
 
 def status_from_frame(rx: list[int]) -> int:
-    # 16-bit STATUS word is MSB-aligned in the first 24-bit response word.
+    # combines the first two bytes of the received frame into a 16-bit STATUS word. 
     return (rx[0] << 8) | rx[1]
 
 
 def channels_from_frame(rx: list[int]) -> list[int]:
+    # extracts the three 24-bit channel readings from the received frame and converts them to signed integers.
     return [signed24(rx[3:6]), signed24(rx[6:9]), signed24(rx[9:12])]
 
 
 def main() -> int:
     spi = spidev.SpiDev()
+    #GPIO OutputDevices
     reset = None
     xen = None
 
     try:
-        # GPIO outputs created before touching ADC. 
         # reset pulse requires CLKIN to be running; afterwards stop XEN while configuring
         # the ADC, then restart it only after DCDC_FREQ/DCDC_EN are set.
         reset = DigitalOutputDevice(RST_BCM, initial_value=True)
         xen = DigitalOutputDevice(XEN_BCM, initial_value=False)
 
-        spi.open(SPI_BUS, SPI_DEVICE)
+        spi.open(SPI_BUS, SPI_DEVICE) #selects the SPI bus and device (chip select) to use for communication with the ADC
         spi.mode = SPI_MODE
         spi.max_speed_hz = SPI_HZ
-        spi.bits_per_word = 8
+        spi.bits_per_word = 8 # 8 bit
 
         time.sleep(0.05)  # allow board supplies to settle
         xen.on()
@@ -119,7 +124,7 @@ def main() -> int:
         null_frame()
 
         # SEC_FAIL is latched at startup and clears when STATUS is read after
-        # the isolated-side supply is valid. Poll it over SPI, not the RDY pin.
+        # the isolated-side supply is valid. Poll it over SPI until it clears or timeout after 5 seconds.
         deadline = time.monotonic() + 5.0
         status = 0
         while time.monotonic() < deadline:
@@ -129,6 +134,8 @@ def main() -> int:
                 raise RuntimeError(
                     f"Unexpected STATUS 0x{status:04X}; check SPI wiring/mode."
                 )
+                
+            # check if SEC_FAIL bit is cleared; if so, break the loop. Otherwise, sleep for 1 ms and try again.
             if not (status & STATUS_SEC_FAIL):
                 break
             time.sleep(0.001)
@@ -142,7 +149,7 @@ def main() -> int:
         print("Default gain is 1 (nominal differential range +/-1.2 V).")
 
 
-        # Build a baseline, then flag CH0/CH1 deviations from it.
+        # Build baseline, then flag CH0/CH1 deviations from it.
         discard = 2
         PRINT_INTERVAL = 0.5
         ANOMALY_THRESHOLD_V = 0.10
@@ -156,20 +163,27 @@ def main() -> int:
 
         print(f"Calibrating CH0/CH1 baseline from {BASELINE_SAMPLES} samples... Deviations -+0.10V will be flagged as anomalies.")
 
+        # loops indefinitely until CTRL+C is pressed
+        # reads ADC's status and channel data, checking for anomalies, and printing status information
         while True:
-            rx = null_frame()
+            rx = null_frame() # send NULL command frame to ADC and receive a response frame containing the STATUS word and channel data
             status = status_from_frame(rx)
-
+            
+            # check for SEC_FAIL bit in the STATUS word. If set, raise a RuntimeError indicating that the ADC reported SEC_FAIL.
             if status & STATUS_SEC_FAIL:
                 raise RuntimeError(f"ADC reported SEC_FAIL: STATUS=0x{status:04X}")
 
+            # check if all channels are ready by checking the STATUS_READY_MASK. 
+            # If all channels ready, extract  channel data from the received frame, convertto volts, and process for baseline calibration or anomaly detection.
             if (status & STATUS_READY_MASK) == STATUS_READY_MASK:
                 raw = channels_from_frame(rx)
                 volts = [value * VOLTS_PER_CODE for value in raw]
 
+                # discard counter used to skip first few samples after startup or reset to allow the ADC to stabilize.
                 if discard:
                     discard -= 1
 
+                # if baseline is None, accumulates the voltage readings for CH0 and CH1 to calculate the baseline
                 elif baseline is None:
                     calibration_sums[0] += volts[0]
                     calibration_sums[1] += volts[1]
@@ -185,6 +199,7 @@ def main() -> int:
                             f"CH1={baseline[1]:+.4f} V"
                         )
 
+                # if baseline not None, checks for anomalies in CH0 and CH1 by comparing the current voltage readings to baseline.
                 else:
                     for channel in range(2):
                         deviation = volts[channel] - baseline[channel]
