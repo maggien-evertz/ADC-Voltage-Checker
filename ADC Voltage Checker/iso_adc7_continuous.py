@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Read ISO ADC 7 / AMC131M03 voltage data on Raspberry Pi SPI0."""
 
+import spidev
 import json
 import logging
 import sys
 import time
-from datetime import datetime
 
-import spidev
+from datetime import datetime
+from pathlib import Path
 from gpiozero import DigitalOutputDevice
 
 # BCM numbers for gpiozero:
@@ -25,7 +26,7 @@ FRAME_BYTES = FRAME_WORDS * 3  # 5 x 24-bit words, each frame is 15 bytes
 
 # (1000 samples per second per channel at 8.192 MHz). Gain register reset is 0 => gain 1 (no amplification), +/-1.2 V differential.
 REG_CLOCK = 0x03                         #selects the clock and data rate settings for the ADC
-CLOCK_1000_SPS = 0x0716                  #enable all 3 channels, high resolution mode, divide clock by 2, set oversampling ratio to 16384 for 1000 samples per second
+CLOCK_1000_SPS = 0x0716                  #enable all 3 channels, high resolution mode, divide clock by 2, set oversampling ratio to 4096 for 1000 samples per second
 REG_DCDC_CTRL = 0x31                     #selects the DCDC converter frequency and enables it
 DCDC_FREQ_4P096_MHZ_AND_ENABLE = 0x0001  # DCDC_FREQ=0000b, DCDC_EN=1
 
@@ -40,12 +41,15 @@ ANOMALY_THRESHOLD_V = 0.10
 BASELINE_SAMPLES = 100
 
 # Logging configuration
+LOG_FILE = Path(__file__).resolve().with_name("log.txt")
+
 logging.basicConfig(
-    filename="log.txt",
-    filemode="a",  # append; don't overwrite earlier anomalies
+    filename=LOG_FILE,
+    filemode="a",
     level=logging.WARNING,
     format="%(asctime)s %(levelname)s %(message)s",
 )
+
 
 # Function to report anomalies with timestamp and details
 def report_anomaly(reason, **details):
@@ -274,6 +278,7 @@ def main() -> int:
             except Exception:
                 logging.exception("Failed to reset ADC during shutdown")
 
+        
         if xen is not None:
             try:
                 xen.off()
