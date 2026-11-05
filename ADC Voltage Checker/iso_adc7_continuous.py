@@ -12,6 +12,10 @@ import spidev
 from gpiozero import DigitalOutputDevice
 #gpiozero lets the script to control the Pi's GPIO pins.
 
+import json
+import logging
+from datetime import datetime
+
 # BCM numbers for gpiozero:
 # RST XEN physical pins 18 and 22
 SPI_BUS = 0
@@ -37,7 +41,25 @@ STATUS_READY_MASK = 0b111        #bits 0-2 of STATUS word indicate the ready sta
 # With gain=1, the differential full-scale is +/-1.2 V.
 VOLTS_PER_CODE = 1.2 / (1 << 23) # 1.2 V / 2^23
 
+# Logging configuration
+logging.basicConfig(
+    filename="log.txt",
+    filemode="a",  # append; don't overwrite earlier anomalies
+    level=logging.WARNING,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 
+# Function to report anomalies with timestamp and details
+def report_anomaly(reason, **details):
+    record = {
+        "timestamp": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+        "anomaly": reason,
+        **details,
+    }
+    message = json.dumps(record, default=str)
+    print(f"ANOMALY: {message}", flush=True)
+    logging.warning(message)
+    
 # functions converts ADC's SPI frame format and python ints.
 # SPI sends/receives bytes, ADC organizes into 24-bit words, and Python uses arbitrary-length ints.
 def word24(word16: int) -> list[int]:
@@ -213,6 +235,19 @@ def main() -> int:
                                 f"change {deviation:+.4f} V)"
                             )
 
+                            report_anomaly(
+                                f"CH{channel} deviation exceeded threshold",
+                                status=f"0x{status:04X}",
+                                raw_frame=rx,
+                                raw_codes=raw,
+                                voltages=volts,
+                                channel=channel,
+                                reading_volts=volts[channel],
+                                baseline_volts=baseline[channel],
+                                deviation_volts=deviation,
+                                threshold_volts=ANOMALY_THRESHOLD_V,
+                            )
+
                         anomaly_active[channel] = is_anomaly
 
                     now = time.monotonic()
@@ -228,16 +263,16 @@ def main() -> int:
             time.sleep(0.001)
 
             
-    #program shutdown and clean-up
+    # program shutdown and clean-up
     except KeyboardInterrupt:
         print("Stopped.")
         return 130
-        #stopped prints out when pressing CTRL+C
+        # CTRL+C stops the program, returns exit code 130
         
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-        #catches other erros, prints to standard error
+        #catches other errors, prints to standard error
         
     finally:
         # cleanup: put the ADC in reset before stopping its clock.
