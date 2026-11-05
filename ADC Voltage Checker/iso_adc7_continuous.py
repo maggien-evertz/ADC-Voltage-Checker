@@ -48,7 +48,7 @@ def word24(word16: int) -> list[int]:
 
 def command_frame(command: int) -> list[int]:
     # build five-word frame, puts command in first word. Adds zero padding; input CRC disabled
-    return word24(command) + [0] * (3 * (FRAME_WORDS - 1))
+    return word24(command) + [0] * (FRAME_BYTES - 3)
 
 
 def wreg_frame(address: int, value: int) -> list[int]:
@@ -57,7 +57,7 @@ def wreg_frame(address: int, value: int) -> list[int]:
     command = 0x6000 | ((address & 0x3F) << 7)
     # one command word, one register-data word, then three words to complete
     # the standard five-word frame
-    return word24(command) + word24(value) + [0] * (3 * 3)
+    return word24(command) + word24(value) + [0] * (FRAME_BYTES - 6)
 
 
 def signed24(data: list[int]) -> int:
@@ -150,7 +150,7 @@ def main() -> int:
 
 
         # Build baseline, then flag CH0/CH1 deviations from it.
-        discard = 2
+        discard = 10 
         PRINT_INTERVAL = 0.5
         ANOMALY_THRESHOLD_V = 0.10
         BASELINE_SAMPLES = 100
@@ -161,7 +161,7 @@ def main() -> int:
         anomaly_active = [False, False]
         last_print = 0.0
 
-        print(f"Calibrating CH0/CH1 baseline from {BASELINE_SAMPLES} samples... Deviations -+0.10V will be flagged as anomalies.")
+        print(f"Calibrating CH0/CH1 baseline from {BASELINE_SAMPLES} samples... Deviations +/-0.10V will be flagged as anomalies.")
 
         # loops indefinitely until CTRL+C is pressed
         # reads ADC's status and channel data, checking for anomalies, and printing status information
