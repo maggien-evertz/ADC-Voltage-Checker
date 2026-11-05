@@ -1,20 +1,14 @@
 #!/usr/bin/env python3
-"""ISO ADC 7 / AMC131M03 for Raspberry Pi SPI0.
-
-script reads the AMC131M03 STATUS word over SPI and polls its per-channel
-DRDY bits. Catches anolmalies in CH0/CH1 voltage relative to a baseline established at startup.
-"""
-
-import sys
-import time
-
-import spidev
-from gpiozero import DigitalOutputDevice
-#gpiozero lets the script to control the Pi's GPIO pins.
+"""Read ISO ADC 7 / AMC131M03 voltage data on Raspberry Pi SPI0."""
 
 import json
 import logging
+import sys
+import time
 from datetime import datetime
+
+import spidev
+from gpiozero import DigitalOutputDevice
 
 # BCM numbers for gpiozero:
 # RST XEN physical pins 18 and 22
@@ -40,6 +34,10 @@ STATUS_READY_MASK = 0b111        #bits 0-2 of STATUS word indicate the ready sta
 
 # With gain=1, the differential full-scale is +/-1.2 V.
 VOLTS_PER_CODE = 1.2 / (1 << 23) # 1.2 V / 2^23
+STARTUP_DISCARD_SAMPLES = 10
+PRINT_INTERVAL = 0.5
+ANOMALY_THRESHOLD_V = 0.10
+BASELINE_SAMPLES = 100
 
 # Logging configuration
 logging.basicConfig(
@@ -171,11 +169,8 @@ def main() -> int:
         print("Default gain is 1 (nominal differential range +/-1.2 V).")
 
 
-        # Build baseline, then flag CH0/CH1 deviations from it.
-        discard = 10 
-        PRINT_INTERVAL = 0.5
-        ANOMALY_THRESHOLD_V = 0.10
-        BASELINE_SAMPLES = 100
+        # Build a baseline, then flag CH0/CH1 deviations from it.
+        discard = STARTUP_DISCARD_SAMPLES
 
         calibration_sums = [0.0, 0.0]
         calibration_count = 0
@@ -183,7 +178,10 @@ def main() -> int:
         anomaly_active = [False, False]
         last_print = 0.0
 
-        print(f"Calibrating CH0/CH1 baseline from {BASELINE_SAMPLES} samples... Deviations +/-0.10V will be flagged as anomalies.")
+        print(
+            f"Calibrating CH0/CH1 baseline from {BASELINE_SAMPLES} samples... "
+            f"Deviations +/-{ANOMALY_THRESHOLD_V:.2f} V will be flagged as anomalies."
+        )
 
         # loops indefinitely until CTRL+C is pressed
         # reads ADC's status and channel data, checking for anomalies, and printing status information
@@ -207,8 +205,8 @@ def main() -> int:
 
                 # if baseline is None, accumulates the voltage readings for CH0 and CH1 to calculate the baseline
                 elif baseline is None:
-                    calibration_sums[0] += volts[0]
-                    calibration_sums[1] += volts[1]
+                    for channel in range(2):
+                        calibration_sums[channel] += volts[channel]
                     calibration_count += 1
 
                     if calibration_count == BASELINE_SAMPLES:
@@ -228,13 +226,6 @@ def main() -> int:
                         is_anomaly = abs(deviation) > ANOMALY_THRESHOLD_V
 
                         if is_anomaly and not anomaly_active[channel]:
-                            print(
-                                f"ANOMALY CH{channel}: "
-                                f"{volts[channel]:+.4f} V "
-                                f"(baseline {baseline[channel]:+.4f} V, "
-                                f"change {deviation:+.4f} V)"
-                            )
-
                             report_anomaly(
                                 f"CH{channel} deviation exceeded threshold",
                                 status=f"0x{status:04X}",
@@ -273,25 +264,38 @@ def main() -> int:
         #catches other errors, prints to standard error
         
     finally:
-        # cleanup: put the ADC in reset before stopping its clock.
-        try:
-            if reset is not None:
+        # Apply the startup reset pulse before stopping the ADC clock.
+        if reset is not None:
+            try:
                 reset.off()
-            if xen is not None:
-                xen.off()
-            time.sleep(0.005)
-            if reset is not None:
+                time.sleep(0.001)
                 reset.on()
-        except Exception:
-            pass
+                time.sleep(0.01)
+            except Exception:
+                logging.exception("Failed to reset ADC during shutdown")
+
+        if xen is not None:
+            try:
+                xen.off()
+            except Exception:
+                logging.exception("Failed to stop ADC clock during shutdown")
+
         try:
             spi.close()
         except Exception:
-            pass
+            logging.exception("Failed to close SPI during shutdown")
+
         if xen is not None:
-            xen.close()
+            try:
+                xen.close()
+            except Exception:
+                logging.exception("Failed to close XEN GPIO during shutdown")
+
         if reset is not None:
-            reset.close()
+            try:
+                reset.close()
+            except Exception:
+                logging.exception("Failed to close reset GPIO during shutdown")
 
 
 if __name__ == "__main__":
