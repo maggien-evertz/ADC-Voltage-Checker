@@ -7,6 +7,7 @@ import json
 import logging
 import math
 from pathlib import Path
+import signal
 import sys
 from threading import Event
 import time
@@ -130,9 +131,17 @@ def main() -> int:
     xen = None
     plot_fig = None
     stop_event = Event()
+    interrupt_event = Event()
 
+    def request_shutdown(_signum, _frame):
+        interrupt_event.set()
+        stop_event.set()
+
+    previous_sigint_handler = signal.getsignal(signal.SIGINT)
 
     try:
+        signal.signal(signal.SIGINT, request_shutdown)
+
         # reset pulse requires CLKIN to be running; afterwards stop XEN while configuring
         # the ADC, then restart it only after DCDC_FREQ/DCDC_EN are set.
         reset = DigitalOutputDevice(RST_BCM, initial_value=True)
@@ -313,7 +322,6 @@ def main() -> int:
                     plt.pause(0.001)
                     last_plot_update = now
 
-
                 # discard counter used to skip first few samples after startup or reset to allow the ADC to stabilize.
                 if discard:
                     discard -= 1
@@ -366,6 +374,10 @@ def main() -> int:
                         )
                         last_print = now
 
+        if interrupt_event.is_set():
+            print("Stopped.")
+            return 130
+        return 0
             
     # program shutdown and clean-up
     except KeyboardInterrupt:
@@ -418,6 +430,8 @@ def main() -> int:
                 plt.close(plot_fig)
             except Exception:
                 logging.exception("Failed to close waveform plot")
+
+        signal.signal(signal.SIGINT, previous_sigint_handler)
 
 if __name__ == "__main__":
     raise SystemExit(main())
