@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """Read ISO ADC 7 / AMC131M03 voltage data on Raspberry Pi SPI0."""
 
+from datetime import datetime
+from pathlib import Path
+from gpiozero import DigitalOutputDevice
+from collections import deque
+
 import spidev
 import json
 import logging
 import sys
 import time
+import matplotlib.pyplot as plt
 
-from datetime import datetime
-from pathlib import Path
-from gpiozero import DigitalOutputDevice
+
 
 # BCM numbers for gpiozero:
 # RST XEN physical pins 18 and 22
@@ -39,6 +43,11 @@ STARTUP_DISCARD_SAMPLES = 10
 PRINT_INTERVAL = 0.5
 ANOMALY_THRESHOLD_V = 0.10
 BASELINE_SAMPLES = 100
+
+# MatPlotlib configuration for plotting
+PLOT_WINDOW_SECONDS = 5.0
+PLOT_REFRESH_SECONDS = 0.05
+
 
 # Logging configuration
 LOG_FILE = Path(__file__).resolve().with_name("log.txt")
@@ -106,6 +115,8 @@ def main() -> int:
     #GPIO OutputDevices
     reset = None
     xen = None
+    plot_fig = None
+
 
     try:
         # reset pulse requires CLKIN to be running; afterwards stop XEN while configuring
@@ -187,6 +198,26 @@ def main() -> int:
             f"Deviations +/-{ANOMALY_THRESHOLD_V:.2f} V will be flagged as anomalies."
         )
 
+        # Set up Matplotlib for live plotting of ADC channel data
+        plt.ion()
+        plot_fig, plot_ax = plt.subplots()
+        plot_lines = [
+            plot_ax.plot([], [], label=f"CH{i}")[0]
+            for i in range(3)
+        ]
+        plot_ax.set_xlabel("Time (s)")
+        plot_ax.set_ylabel("Voltage (V)")
+        plot_ax.set_title("AMC131M03 Live Waveform")
+        plot_ax.grid(True)
+        plot_ax.legend()
+        plot_fig.tight_layout()
+        plt.show(block=False)
+
+        plot_times = deque()
+        plot_values = [deque() for _ in range(3)]
+        plot_start = time.monotonic()
+        last_plot_update = plot_start
+        
         # loops indefinitely until CTRL+C is pressed
         # reads ADC's status and channel data, checking for anomalies, and printing status information
         while True:
@@ -202,6 +233,33 @@ def main() -> int:
             if (status & STATUS_READY_MASK) == STATUS_READY_MASK:
                 raw = channels_from_frame(rx)
                 volts = [value * VOLTS_PER_CODE for value in raw]
+                
+                sample_time = time.monotonic() - plot_start
+                plot_times.append(sample_time)
+                for channel, value in enumerate(volts):
+                    plot_values[channel].append(value)
+
+                # Keep only the rolling time window in memory.
+                while plot_times and sample_time - plot_times[0] > PLOT_WINDOW_SECONDS:
+                    plot_times.popleft()
+                    for channel_values in plot_values:
+                        channel_values.popleft()
+
+                now = time.monotonic()
+                if now - last_plot_update >= PLOT_REFRESH_SECONDS:
+                    for line, channel_values in zip(plot_lines, plot_values):
+                        line.set_data(plot_times, channel_values)
+
+                    right = max(PLOT_WINDOW_SECONDS, sample_time)
+                    plot_ax.set_xlim(right - PLOT_WINDOW_SECONDS, right)
+                    plot_ax.relim()
+                    plot_ax.autoscale_view(scalex=False, scaley=True)
+
+                    plot_fig.canvas.draw_idle()
+                    plot_fig.canvas.flush_events()
+                    plt.pause(0.001)
+                    last_plot_update = now
+
 
                 # discard counter used to skip first few samples after startup or reset to allow the ADC to stabilize.
                 if discard:
@@ -301,7 +359,12 @@ def main() -> int:
                 reset.close()
             except Exception:
                 logging.exception("Failed to close reset GPIO during shutdown")
-
+                
+        if plot_fig is not None:
+            try:
+                plt.close(plot_fig)
+            except Exception:
+                logging.exception("Failed to close waveform plot")
 
 if __name__ == "__main__":
     raise SystemExit(main())
