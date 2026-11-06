@@ -8,6 +8,7 @@ import logging
 import math
 from pathlib import Path
 import sys
+from threading import Event
 import time
 
 import matplotlib
@@ -128,6 +129,7 @@ def main() -> int:
     reset = None
     xen = None
     plot_fig = None
+    stop_event = Event()
 
 
     try:
@@ -221,9 +223,12 @@ def main() -> int:
         plot_ax.set_ylabel("Voltage (V)")
         plot_ax.set_title("AMC131M03 Live Waveform")
         plot_ax.grid(True)
-        plot_ax.legend()
+        plot_ax.legend(
+            loc="upper right",
+            bbox_to_anchor=(0.98, 0.50),
+        )
         rms_text = plot_ax.text(
-            0.99, 0.98, "RMS: collecting samples...",
+            0.98, 0.68, "RMS: collecting samples...",
             transform=plot_ax.transAxes,
             ha="right", va="top",
             fontsize=8,
@@ -231,6 +236,19 @@ def main() -> int:
         )
 
         plot_fig.tight_layout()
+        plot_fig.canvas.mpl_connect(
+            "close_event",
+            lambda event: stop_event.set()
+            if event.canvas is plot_fig.canvas
+            else None,
+        )
+
+        def stop_from_plot_key(event):
+            if event.key and event.key.lower() == "ctrl+c":
+                print("Stopped.")
+                stop_event.set()
+
+        plot_fig.canvas.mpl_connect("key_press_event", stop_from_plot_key)
         plt.show(block=False)
 
         plot_times = deque()
@@ -240,7 +258,7 @@ def main() -> int:
         
         # loops indefinitely until CTRL+C is pressed
         # reads ADC's status and channel data, checking for anomalies, and printing status information
-        while True:
+        while not stop_event.is_set():
             rx = null_frame() # send NULL command frame to ADC and receive a response frame containing the STATUS word and channel data
             status = status_from_frame(rx)
             
