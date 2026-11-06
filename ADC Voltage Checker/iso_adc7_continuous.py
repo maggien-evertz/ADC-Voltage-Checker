@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """Read ISO ADC 7 / AMC131M03 voltage data on Raspberry Pi SPI0."""
 
-from datetime import datetime
-from pathlib import Path
-from gpiozero import DigitalOutputDevice
 from collections import deque
-
-import spidev
+from datetime import datetime
 import json
 import logging
+import math
+from pathlib import Path
 import sys
 import time
-import matplotlib.pyplot as plt
 
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from gpiozero import DigitalOutputDevice
+import spidev
 
 
 # BCM numbers for gpiozero:
@@ -59,6 +61,16 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 
+# Calculate AC and total RMS from voltage samples.
+def rms_from_volts(samples):
+    n = len(samples)
+    if n < 2:
+        return None, None
+
+    mean = sum(samples) / n
+    ac_rms = math.sqrt(sum((v - mean) ** 2 for v in samples) / n)
+    total_rms = math.sqrt(sum(v ** 2 for v in samples) / n)
+    return ac_rms, total_rms
 
 # Function to report anomalies with timestamp and details
 def report_anomaly(reason, **details):
@@ -210,6 +222,14 @@ def main() -> int:
         plot_ax.set_title("AMC131M03 Live Waveform")
         plot_ax.grid(True)
         plot_ax.legend()
+        rms_text = plot_ax.text(
+            0.99, 0.98, "RMS: collecting samples...",
+            transform=plot_ax.transAxes,
+            ha="right", va="top",
+            fontsize=8,
+            bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "none"},
+        )
+
         plot_fig.tight_layout()
         plt.show(block=False)
 
@@ -254,6 +274,21 @@ def main() -> int:
                     plot_ax.set_xlim(right - PLOT_WINDOW_SECONDS, right)
                     plot_ax.relim()
                     plot_ax.autoscale_view(scalex=False, scaley=True)
+
+                    rms_rows = []
+                    for channel, samples in enumerate(plot_values):
+                        ac_rms, total_rms = rms_from_volts(samples)
+                        if ac_rms is not None:
+                            rms_rows.append(
+                                f"CH{channel}: AC {ac_rms:.4f} V | total {total_rms:.4f} V"
+                            )
+                        else:
+                            rms_rows.append(f"CH{channel}: collecting...")
+
+                    rms_text.set_text(
+                        "ADC-input RMS (rolling plot window, up to 5 s)\n"
+                        + "\n".join(rms_rows)
+                    )
 
                     plot_fig.canvas.draw_idle()
                     plot_fig.canvas.flush_events()
