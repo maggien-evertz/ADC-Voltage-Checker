@@ -2,8 +2,8 @@
 """
 Read ISO ADC 7 / AMC131M03 voltage data on Raspberry Pi SPI0.
 Multi-threaded architecture: background thread handles high-speed SPI polling,
-calibration, and anomaly detection; main thread manages live Matplotlib visualization.
-Optimized with a short time window to display clean AC sine waves.
+calibration, zero-crossing frequency tracking, synchronized RMS, and anomaly detection.
+Main thread manages live Matplotlib visualization.
 """
 
 from collections import deque
@@ -53,6 +53,7 @@ STATUS_READY_MASK = 0b111        # bits 0-2 indicate data conversion readiness f
 
 # voltage conversion scale factor: gain=1 gives a differential full-scale range of +/-1.2 v across 2^23 resolution steps.
 VOLTS_PER_CODE = 1.2 / (1 << 23) 
+SAMPLING_RATE_HZ = 1000.0        # nominal sampling frequency in hertz
 STARTUP_DISCARD_SAMPLES = 10
 PRINT_INTERVAL = 0.5
 ANOMALY_THRESHOLD_V = 0.10
@@ -78,19 +79,35 @@ logging.basicConfig(
 # MATHEMATICAL CALCULATIONS AND UTILITY HELPER FUNCTIONS
 # ==============================================================================
 
-def rms_from_volts(samples):
+def synchronized_rms_from_volts(samples, frequency_hz):
     """
-    calculates ac rms and total rms voltage from a list of collected samples.
-    ac rms removes the dc offset (mean), whereas total rms includes the dc component.
+    calculates synchronized ac rms and total rms voltage based on measured line frequency.
+    slices samples to an exact integer number of ac cycles to eliminate boundary distortion.
     """
     n = len(samples)
-    if n < 2:
-        return None, None
+    if n < 2 or frequency_hz <= 0:
+        return None, None, 0.0
 
-    mean = sum(samples) / n
-    ac_rms = math.sqrt(sum((v - mean) ** 2 for v in samples) / n)
-    total_rms = math.sqrt(sum(v ** 2 for v in samples) / n)
-    return ac_rms, total_rms
+    # calculate how many samples comprise one complete ac cycle
+    samples_per_cycle = SAMPLING_RATE_HZ / frequency_hz
+    
+    # target an integer number of cycles (e.g., up to 5 complete cycles or available samples)
+    target_cycles = 5
+    required_samples = int(round(samples_per_cycle * target_cycles))
+    
+    if n >= required_samples and required_samples > 0:
+        active_samples = samples[-required_samples:]
+    else:
+        active_samples = samples
+
+    m = len(active_samples)
+    if m < 2:
+        return None, None, frequency_hz
+
+    mean = sum(active_samples) / m
+    ac_rms = math.sqrt(sum((v - mean) ** 2 for v in active_samples) / m)
+    total_rms = math.sqrt(sum(v ** 2 for v in active_samples) / m)
+    return ac_rms, total_rms, frequency_hz
 
 
 def report_anomaly(reason, **details):
@@ -157,7 +174,7 @@ def channels_from_frame(rx: list[int]) -> list[int]:
 def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
     """
     runs independently in a background thread to ensure continuous, high-speed spi data collection
-    without getting blocked by ui rendering delays. handles register flushing, power checks, baseline calibration, and monitoring.
+    without getting blocked by ui rendering delays. handles frequency tracking, calibration, and monitoring.
     """
     try:
         # local helper function to send a null command frame and fetch the raw response bytes from the spi bus
@@ -197,6 +214,11 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
         anomaly_active = [False, False]
         last_print = 0.0
         
+        # variables for zero-crossing frequency tracking on channel 0
+        prev_voltage = 0.0
+        prev_crossing_time = None
+        current_frequency = 60.0  # default fallback frequency assumption (60 hz)
+        
         start_time = time.monotonic()
 
         # continuous polling loop executing in the background thread
@@ -214,10 +236,24 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
                 volts = [value * VOLTS_PER_CODE for value in raw]
                 
                 sample_time = time.monotonic() - start_time
+                ch0_volts = volts[0]
 
-                # safely acquire thread lock to append new samples into the shared data structures for the ui thread
+                # zero-crossing frequency detection on ch0 (positive-going transition: prev < 0 and current >= 0)
+                if prev_voltage < 0.0 and ch0_volts >= 0.0:
+                    if prev_crossing_time is not None:
+                        period = sample_time - prev_crossing_time
+                        if 0.01 < period < 0.04:  # valid range for 25 hz to 100 hz grids
+                            measured_freq = 1.0 / period
+                            # smooth frequency updates using a moving average weight
+                            current_frequency = (0.8 * current_frequency) + (0.2 * measured_freq)
+                    prev_crossing_time = sample_time
+
+                prev_voltage = ch0_volts
+
+                # safely acquire thread lock to append new samples and frequency into shared state
                 with data_lock:
                     shared_state["times"].append(sample_time)
+                    shared_state["frequency"] = current_frequency
                     for channel, val in enumerate(volts):
                         shared_state["values"][channel].append(val)
 
@@ -269,14 +305,12 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
 
                         anomaly_active[channel] = is_anomaly
 
-                    # throttle console text updates to maintain readable output frequencies
+                    # throttle console text updates to maintain readable output frequencies including frequency
                     now = time.monotonic()
                     if now - last_print >= PRINT_INTERVAL:
                         print(
-                            f"Status=0x{status:04X}  "
-                            f"CH0={volts[0]:+.4f}V  "
-                            f"CH1={volts[1]:+.4f}V  "
-                            f"CH2={volts[2]:+.4f}V"
+                            f"Status=0x{status:04X}  Freq={current_frequency:.2f}Hz  "
+                            f"CH0={volts[0]:+.4f}V  CH1={volts[1]:+.4f}V  CH2={volts[2]:+.4f}V"
                         )
                         last_print = now
 
@@ -298,10 +332,11 @@ def main() -> int:
     stop_event = Event()
     data_lock = Lock()
 
-    # define shared state dictionary containing rolling deques accessed safely across threads
+    # define shared state dictionary containing rolling deques and frequency tracked across threads
     shared_state = {
         "times": deque(),
-        "values": [deque(), deque(), deque()]
+        "values": [deque(), deque(), deque()],
+        "frequency": 60.0
     }
 
     def request_shutdown(_signum, _frame):
@@ -359,7 +394,7 @@ def main() -> int:
         ]
         plot_ax.set_xlabel("Time (s)")
         plot_ax.set_ylabel("Voltage (V)")
-        plot_ax.set_title("AMC131M03 Live AC Sine Wave Monitor")
+        plot_ax.set_title("AMC131M03 Live AC Sine Wave & Frequency Tracker")
         plot_ax.grid(True)
         plot_ax.legend(
             loc="upper right",
@@ -399,6 +434,7 @@ def main() -> int:
                 with data_lock:
                     local_times = list(shared_state["times"])
                     local_values = [list(ch) for ch in shared_state["values"]]
+                    local_freq = shared_state["frequency"]
 
                 if local_times:
                     for line, channel_values in zip(plot_lines, local_values):
@@ -410,9 +446,9 @@ def main() -> int:
                     plot_ax.relim()
                     plot_ax.autoscale_view(scalex=False, scaley=True)
 
-                    rms_rows = []
+                    rms_rows = [f"Grid Frequency: {local_freq:.2f} Hz"]
                     for channel, samples in enumerate(local_values):
-                        ac_rms, total_rms = rms_from_volts(samples)
+                        ac_rms, total_rms, _ = synchronized_rms_from_volts(samples, local_freq)
                         if ac_rms is not None:
                             rms_rows.append(
                                 f"CH{channel}: AC {ac_rms:.4f}V | Total {total_rms:.4f}V"
@@ -420,10 +456,7 @@ def main() -> int:
                         else:
                             rms_rows.append(f"CH{channel}: Collecting...")
 
-                    rms_text.set_text(
-                        f"AC Input RMS (Rolling {PLOT_WINDOW_SECONDS}s Window)\n"
-                        + "\n".join(rms_rows)
-                    )
+                    rms_text.set_text("\n".join(rms_rows))
 
                     plot_fig.canvas.draw_idle()
                     plot_fig.canvas.flush_events()
