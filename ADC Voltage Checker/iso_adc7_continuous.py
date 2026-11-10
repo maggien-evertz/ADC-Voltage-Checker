@@ -46,7 +46,7 @@ FRAME_BYTES = FRAME_WORDS * 3
 
 # select the clock configuration register and the adc clock-control register.
 REG_CLOCK = 0x03
-CLOCK_1000_SPS = 0x0716
+CLOCK_600_SPS = 0x0716
 REG_DCDC_CTRL = 0x31
 DCDC_FREQ_4P096_MHZ_AND_ENABLE = 0x0001
 
@@ -57,7 +57,7 @@ STATUS_READY_MASK = 0b111
 # convert the signed adc code to a voltage using the nominal differential input range.
 VOLTS_PER_CODE = 1.2 / (1 << 23)
 # nominal conversion rate used by the trigger and rms calculations.
-SAMPLING_RATE_HZ = 1000.0  # Nominal; verify against the ADC configuration.
+SAMPLING_RATE_HZ = 600.0  # Nominal; verify against the ADC configuration.
 # keep a rolling 100-sample window for trigger capture and overlay analysis.
 TRIGGER_BUFFER_SIZE = 100
 MAX_OVERLAY_BLOCKS = 10
@@ -466,7 +466,7 @@ def main() -> int:
         time.sleep(0.005)
 
         # Configure ADC registers.
-        spi.xfer2(wreg_frame(REG_CLOCK, CLOCK_1000_SPS))
+        spi.xfer2(wreg_frame(REG_CLOCK, CLOCK_600_SPS))
         spi.xfer2(wreg_frame(REG_DCDC_CTRL, 0x0000))
         spi.xfer2(
             wreg_frame(REG_DCDC_CTRL, DCDC_FREQ_4P096_MHZ_AND_ENABLE)

@@ -48,7 +48,7 @@ FRAME_BYTES = FRAME_WORDS * 3
 
 # select the adc clock and power-control registers used during configuration.
 REG_CLOCK = 0x03
-CLOCK_1000_SPS = 0x0716
+CLOCK_600_SPS = 0x0716
 REG_DCDC_CTRL = 0x31
 DCDC_FREQ_4P096_MHZ_AND_ENABLE = 0x0001
 
@@ -59,7 +59,7 @@ STATUS_READY_MASK = 0b111
 # convert the raw adc code to a measured differential voltage for each channel.
 VOLTS_PER_CODE = 1.2 / (1 << 23)
 # nominal sample rate used by the waveform and rms calculations.
-SAMPLING_RATE_HZ = 1000.0  # Nominal; verify against the ADC configuration.
+SAMPLING_RATE_HZ = 600.0  # Nominal; verify against the ADC configuration.
 # keep a rolling capture window and average across the last several trigger blocks.
 TRIGGER_BUFFER_SIZE = 100
 AVERAGE_BLOCK_COUNT = 10
@@ -69,6 +69,11 @@ PRINT_INTERVAL = 0.5
 # raise an anomaly when the measured ac rms drifts outside the calibrated baseline.
 ANOMALY_THRESHOLD_V = 0.10  # Difference in AC RMS from calibrated baseline.
 # accumulate enough samples to estimate the baseline and detect slow drift.
+BASELINE_SAMPLES = 100
+RMS_CYCLES = 5
+PLOT_REFRESH_SECONDS = 0.04
+
+LOG_FILE = Path(__file__).resolve().with_name("log.txt")
 
 logging.basicConfig(
     filename=LOG_FILE,
@@ -176,6 +181,12 @@ def status_from_frame(rx: list[int]) -> int:
 def channels_from_frame(rx: list[int]) -> list[int]:
     """Extract and sign-extend the three channel readings."""
     # each channel occupies 3 bytes, so the three samples begin at byte index 3.
+    return [
+        signed24(rx[3:6]),
+        signed24(rx[6:9]),
+        signed24(rx[9:12]),
+    ]
+
 # background acquisition worker thread:
 # this thread continuously reads the adc, watches for zero crossings, and maintains
 # the rolling waveform history used for the averaged display and rms tracking.
@@ -189,6 +200,14 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
             return spi.xfer2(command_frame(0x0000))
 
         # flush stale pipeline data after configuration before entering the live loop.
+        null_frame()
+        null_frame()
+
+        # wait for the isolated-side supply fault flag to clear before starting normal operation.
+        deadline = time.monotonic() + 5.0
+        status = 0
+        device_ready = False
+
         while not stop_event.is_set() and time.monotonic() < deadline:
             rx = null_frame()
             status = status_from_frame(rx)
@@ -464,7 +483,7 @@ def main() -> int:
         time.sleep(0.005)
 
         # Configure ADC registers.
-        spi.xfer2(wreg_frame(REG_CLOCK, CLOCK_1000_SPS))
+        spi.xfer2(wreg_frame(REG_CLOCK, CLOCK_600_SPS))
         spi.xfer2(wreg_frame(REG_DCDC_CTRL, 0x0000))
         spi.xfer2(
             wreg_frame(REG_DCDC_CTRL, DCDC_FREQ_4P096_MHZ_AND_ENABLE)
