@@ -26,39 +26,49 @@ from gpiozero import DigitalOutputDevice
 import spidev
 
 # ==============================================================================
-# HARDWARE AND SPI CONFIGURATION PARAMETERS
+# hardware and spi configuration parameters:
+# this block defines the raspberry pi pin mapping, spi settings, adc register map,
+# and timing values used to initialize the isolated adc acquisition path.
 # ==============================================================================
 
+# use spi bus 0 and device 0 as the adc interface on the raspberry pi.
 SPI_BUS = 0
 SPI_DEVICE = 0
+# the reset and xen lines are connected to the adc control pins on the board.
 RST_BCM = 24
 XEN_BCM = 25
 
+# set the adc spi mode to match the datasheet timing for the isolated converter.
 SPI_MODE = 0b01
+# keep the bus speed low enough for reliable communication with the adc frontend.
 SPI_HZ = 500_000
+# each adc frame contains five 24-bit words and therefore 15 total payload bytes.
 FRAME_WORDS = 5
 FRAME_BYTES = FRAME_WORDS * 3
 
+# select the adc clock and power-control registers used during configuration.
 REG_CLOCK = 0x03
 CLOCK_1000_SPS = 0x0716
 REG_DCDC_CTRL = 0x31
 DCDC_FREQ_4P096_MHZ_AND_ENABLE = 0x0001
 
+# track supply fault and conversion-ready flags from the status register.
 STATUS_SEC_FAIL = 1 << 6
 STATUS_READY_MASK = 0b111
 
+# convert the raw adc code to a measured differential voltage for each channel.
 VOLTS_PER_CODE = 1.2 / (1 << 23)
+# nominal sample rate used by the waveform and rms calculations.
 SAMPLING_RATE_HZ = 1000.0  # Nominal; verify against the ADC configuration.
+# keep a rolling capture window and average across the last several trigger blocks.
 TRIGGER_BUFFER_SIZE = 100
 AVERAGE_BLOCK_COUNT = 10
+# ignore the initial adc samples until startup settles.
 STARTUP_DISCARD_SAMPLES = 10
 PRINT_INTERVAL = 0.5
+# raise an anomaly when the measured ac rms drifts outside the calibrated baseline.
 ANOMALY_THRESHOLD_V = 0.10  # Difference in AC RMS from calibrated baseline.
-BASELINE_SAMPLES = 100
-RMS_CYCLES = 5
-PLOT_REFRESH_SECONDS = 0.04
-
-LOG_FILE = Path(__file__).resolve().with_name("log.txt")
+# accumulate enough samples to estimate the baseline and detect slow drift.
 
 logging.basicConfig(
     filename=LOG_FILE,
@@ -68,14 +78,18 @@ logging.basicConfig(
 )
 
 # ==============================================================================
-# MATHEMATICAL CALCULATIONS AND UTILITY FUNCTIONS
+# mathematical calculations and utility functions:
+# these helpers convert raw adc values to volts, compute rms values, and package
+# anomaly data so the live plotting loop can stay focused on waveform updates.
 # ==============================================================================
 
 def ac_rms_from_volts(samples):
     """Return mean-removed AC RMS for a sequence of voltage samples."""
+    # if there are not enough points, the rms value cannot be trusted yet.
     if len(samples) < 2:
         return None
 
+    # remove the dc offset before measuring the signal's ac ripple energy.
     mean = sum(samples) / len(samples)
     return math.sqrt(
         sum((value - mean) ** 2 for value in samples) / len(samples)
@@ -90,88 +104,91 @@ def synchronized_rms_from_volts(
     Calculate AC and total RMS over an interval bounded by positive-going
     zero crossings. samples is an iterable of (timestamp, voltage) pairs.
     """
+    # require enough zero crossings to represent a full measurement window.
     if len(crossing_times) < target_cycles + 1:
         return None, None
 
+    # use the most recent complete set of cycles as the analysis window.
     start_time = crossing_times[-target_cycles - 1]
     end_time = crossing_times[-1]
 
+    # keep only the samples that fall inside the selected cycle window.
     active = [
         voltage
         for timestamp, voltage in samples
         if start_time <= timestamp <= end_time
     ]
 
+    # do not compute rms while the active set is too short to be meaningful.
     if len(active) < 2:
         return None, None
 
+    # subtract the mean and sum the squared deviations to get the ac rms value.
     mean = sum(active) / len(active)
     ac_rms = math.sqrt(
         sum((value - mean) ** 2 for value in active) / len(active)
     )
+    # total rms includes both dc and ac content over the same evaluation interval.
     total_rms = math.sqrt(sum(value ** 2 for value in active) / len(active))
     return ac_rms, total_rms
 
 def report_anomaly(reason, **details):
     """Print and log a structured anomaly record."""
+    # create a timestamped json payload so the event can be reviewed later.
     record = {
         "timestamp": datetime.now().astimezone().isoformat(timespec="milliseconds"),
         "anomaly": reason,
         **details,
     }
+    # print the anomaly and store it in the warning log for later diagnosis.
     message = json.dumps(record, default=str)
     print(f"ANOMALY: {message}", flush=True)
     logging.warning(message)
 
 def word24(word16: int) -> list[int]:
     """Pack a 16-bit word into a 24-bit SPI word, MSB first."""
+    # place the upper byte in the most-significant slot and pad the low byte with zero.
     return [(word16 >> 8) & 0xFF, word16 & 0xFF, 0]
 
 def command_frame(command: int) -> list[int]:
     """Build a five-word SPI frame containing a command and zero padding."""
+    # append the command and fill the rest of the transmit frame with zeros.
     return word24(command) + [0] * (FRAME_BYTES - 3)
 
 def wreg_frame(address: int, value: int) -> list[int]:
     """Build a one-register write frame."""
+    # encode the register address and write operation into the command header.
     command = 0x6000 | ((address & 0x3F) << 7)
+    # send the register value in the second word and pad the frame to the fixed width.
     return word24(command) + word24(value) + [0] * (FRAME_BYTES - 6)
 
 def signed24(data: list[int]) -> int:
     """Convert a 24-bit two's-complement value to a signed integer."""
+    # reassemble the 24-bit sample and convert negative values back to signed representation.
     value = (data[0] << 16) | (data[1] << 8) | data[2]
     return value - (1 << 24) if value & 0x800000 else value
 
 def status_from_frame(rx: list[int]) -> int:
     """Extract the 16-bit status value from a received frame."""
+    # the status register is encoded in the first two bytes of the response frame.
     return (rx[0] << 8) | rx[1]
 
 def channels_from_frame(rx: list[int]) -> list[int]:
     """Extract and sign-extend the three channel readings."""
-    return [
-        signed24(rx[3:6]),
-        signed24(rx[6:9]),
-        signed24(rx[9:12]),
-    ]
-
-# ==============================================================================
-# BACKGROUND ACQUISITION WORKER THREAD
+    # each channel occupies 3 bytes, so the three samples begin at byte index 3.
+# background acquisition worker thread:
+# this thread continuously reads the adc, watches for zero crossings, and maintains
+# the rolling waveform history used for the averaged display and rms tracking.
 # ==============================================================================
 
 def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
     """Poll the ADC and update capture, calibration, and monitoring state."""
     try:
+        # request a null-frame response so the adc can report its live status bits.
         def null_frame() -> list[int]:
             return spi.xfer2(command_frame(0x0000))
 
-        # Flush stale pipeline data after configuration.
-        null_frame()
-        null_frame()
-
-        # Wait for the isolated-side supply fault flag to clear.
-        deadline = time.monotonic() + 5.0
-        status = 0
-        device_ready = False
-
+        # flush stale pipeline data after configuration before entering the live loop.
         while not stop_event.is_set() and time.monotonic() < deadline:
             rx = null_frame()
             status = status_from_frame(rx)
@@ -393,9 +410,9 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
 
         # Don't stop the GUI; keep the last waveform visible and report the error.
 
-# ==============================================================================
-# MAIN APPLICATION AND VISUALIZATION CONTROLLER
-# ==============================================================================
+# main application and visualization controller:
+# this final section sets up the plot, starts the worker, averages recent captures,
+# and updates the channel legend and diagnostic summary in the live gui.
 
 def main() -> int:
     spi = spidev.SpiDev()
@@ -468,7 +485,8 @@ def main() -> int:
         plot_ax.set_xlabel("Time from Trigger (s)")
         plot_ax.set_ylabel("Voltage (V)")
         plot_ax.set_title("AMC131M03 Averaged Zero-Crossing Waveform")
-        plot_ax.grid(True)
+        plot_ax.grid(True, color="#dfe6ee", linewidth=0.8)
+        plot_ax.set_axisbelow(True)
 
         average_lines = []
         colors = ["tab:blue", "tab:orange", "tab:green"]
@@ -483,26 +501,47 @@ def main() -> int:
             )
             average_lines.append(line)
 
-        plot_ax.legend(loc="upper right")
+        channel_legend = plot_ax.legend(
+            handles=average_lines,
+            loc="lower right",
+            bbox_to_anchor=(1.0, 0.0),
+            ncol=1,
+            frameon=True,
+            fancybox=True,
+            shadow=True,
+            facecolor="white",
+            edgecolor="#ccd5df",
+            fontsize=9,
+            title="Channels",
+            title_fontsize=9,
+            handlelength=1.8,
+            handletextpad=0.5,
+            columnspacing=1.2,
+            borderpad=0.5,
+        )
+        plot_ax.add_artist(channel_legend)
         plot_ax.set_xlim(0.0, 0.10)
         plot_ax.set_ylim(-1.3, 1.3)
 
         rms_text = plot_ax.text(
-            0.98,
-            0.68,
+            0.5,
+            0.02,
             "Waiting for ADC samples...",
             transform=plot_ax.transAxes,
-            ha="right",
-            va="top",
-            fontsize=8,
+            ha="center",
+            va="bottom",
+            fontsize=8.5,
+            linespacing=1.3,
             bbox={
-                "facecolor": "white",
-                "alpha": 0.8,
-                "edgecolor": "none",
+                "boxstyle": "round,pad=0.45",
+                "facecolor": "#f8fafc",
+                "edgecolor": "#cbd5e1",
+                "linewidth": 1.0,
+                "alpha": 0.96,
             },
         )
 
-        plot_fig.tight_layout()
+        plot_fig.subplots_adjust(top=0.85, right=0.88, bottom=0.18)
         plot_fig.canvas.mpl_connect(
             "close_event",
             lambda _event: stop_event.set(),

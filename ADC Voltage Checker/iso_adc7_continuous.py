@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Read ISO ADC 7 / AMC131M03 voltage data on Raspberry Pi SPI0.
+Read ISO ADC 7 / AMC131M03 voltage data on Raspberry Pi.
 
 A background thread polls SPI, tracks positive-going zero crossings, captures
 100-sample waveform blocks, calibrates AC RMS baselines, and detects RMS
@@ -25,35 +25,48 @@ import matplotlib.pyplot as plt
 from gpiozero import DigitalOutputDevice
 import spidev
 
-# ==============================================================================
-# HARDWARE AND SPI CONFIGURATION PARAMETERS
-# ==============================================================================
+# hardware and spi configuration parameters:
+# this block defines the raspberry pi pin layout, spi bus settings, adc register map,
+# and timing values used to initialize the isolated adc front end.
 
+# use spi bus 0 on the raspberry pi and target device 0 on that bus.
 SPI_BUS = 0
 SPI_DEVICE = 0
+# the reset and xen pins are connected to the adc hardware control lines.
 RST_BCM = 24
 XEN_BCM = 25
 
+# use spi mode 1 because the adc expects the datasheet timing for clock phase and polarity.
 SPI_MODE = 0b01
+# limit the bus speed to 500 khz to keep the pi and adc interface stable and reliable.
 SPI_HZ = 500_000
+# each adc frame contains five 24-bit words, which totals 15 bytes per transaction.
 FRAME_WORDS = 5
 FRAME_BYTES = FRAME_WORDS * 3
 
+# select the clock configuration register and the adc clock-control register.
 REG_CLOCK = 0x03
 CLOCK_1000_SPS = 0x0716
 REG_DCDC_CTRL = 0x31
 DCDC_FREQ_4P096_MHZ_AND_ENABLE = 0x0001
 
+# the status register includes a supply fault flag and conversion-ready bits for each channel.
 STATUS_SEC_FAIL = 1 << 6
 STATUS_READY_MASK = 0b111
 
+# convert the signed adc code to a voltage using the nominal differential input range.
 VOLTS_PER_CODE = 1.2 / (1 << 23)
+# nominal conversion rate used by the trigger and rms calculations.
 SAMPLING_RATE_HZ = 1000.0  # Nominal; verify against the ADC configuration.
+# keep a rolling 100-sample window for trigger capture and overlay analysis.
 TRIGGER_BUFFER_SIZE = 100
 MAX_OVERLAY_BLOCKS = 10
+# ignore a short startup burst before the adc is considered stable.
 STARTUP_DISCARD_SAMPLES = 10
 PRINT_INTERVAL = 0.5
+# alarm when the measured ac rms deviates from the learned baseline by more than this amount.
 ANOMALY_THRESHOLD_V = 0.10  # Difference in AC RMS from calibrated baseline.
+# collect enough samples to estimate the ac baseline and detect slow drift.
 BASELINE_SAMPLES = 100
 RMS_CYCLES = 5
 PLOT_REFRESH_SECONDS = 0.04
@@ -67,15 +80,17 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 
-# ==============================================================================
-# MATHEMATICAL CALCULATIONS AND UTILITY FUNCTIONS
-# ==============================================================================
+# mathematical calculations and utility helpers:
+# these functions convert raw adc words to volts, compute rms values, detect
+# zero-crossing timing, and record anomaly events while keeping the main logic compact.
 
 def ac_rms_from_volts(samples):
     """Return mean-removed AC RMS for a sequence of voltage samples."""
+    # if there are not enough points, there is no trustworthy rms result yet.
     if len(samples) < 2:
         return None
 
+    # subtract the mean to isolate the ac component before calculating rms.
     mean = sum(samples) / len(samples)
     return math.sqrt(
         sum((value - mean) ** 2 for value in samples) / len(samples)
@@ -86,84 +101,100 @@ def synchronized_rms_from_volts(samples, crossing_times, target_cycles=RMS_CYCLE
     Calculate AC and total RMS over an interval bounded by positive-going
     zero crossings. samples is an iterable of (timestamp, voltage) pairs.
     """
+    # require enough crossings to cover the target number of full cycles.
     if len(crossing_times) < target_cycles + 1:
         return None, None
 
+    # use the most recent full set of cycles as the analysis window.
     start_time = crossing_times[-target_cycles - 1]
     end_time = crossing_times[-1]
 
+    # collect only the samples that fall inside the selected cycle window.
     active = [
         voltage
         for timestamp, voltage in samples
         if start_time <= timestamp <= end_time
     ]
 
+    # skip calculations until at least two samples are present in the active window.
     if len(active) < 2:
         return None, None
 
+    # compute the mean offset and then find the ac rms around it.
     mean = sum(active) / len(active)
     ac_rms = math.sqrt(
         sum((value - mean) ** 2 for value in active) / len(active)
     )
+    # total rms includes both dc and ac energy in the selected interval.
     total_rms = math.sqrt(sum(value ** 2 for value in active) / len(active))
     return ac_rms, total_rms
 
 def report_anomaly(reason, **details):
     """Print and log a structured anomaly record."""
+    # build a timestamped json object so the error can be reviewed later.
     record = {
         "timestamp": datetime.now().astimezone().isoformat(timespec="milliseconds"),
         "anomaly": reason,
         **details,
     }
+    # print to the console and log the event for diagnostics and postmortem review.
     message = json.dumps(record, default=str)
     print(f"ANOMALY: {message}", flush=True)
     logging.warning(message)
 
 def word24(word16: int) -> list[int]:
     """Pack a 16-bit word into a 24-bit SPI word, MSB first."""
+    # move the upper byte to the leftmost position and append the required zero pad byte.
     return [(word16 >> 8) & 0xFF, word16 & 0xFF, 0]
 
 def command_frame(command: int) -> list[int]:
     """Build a five-word SPI frame containing a command and zero padding."""
+    # add the command word followed by enough padding to fill the fixed adc frame length.
     return word24(command) + [0] * (FRAME_BYTES - 3)
 
 def wreg_frame(address: int, value: int) -> list[int]:
     """Build a one-register write frame."""
+    # encode the write-register opcode and register address into the first word.
     command = 0x6000 | ((address & 0x3F) << 7)
+    # append the target register value and pad the remaining payload to the fixed frame size.
     return word24(command) + word24(value) + [0] * (FRAME_BYTES - 6)
 
 def signed24(data: list[int]) -> int:
     """Convert a 24-bit two's-complement value to a signed integer."""
+    # combine the three bytes into a 24-bit word and convert the signed format back to a python int.
     value = (data[0] << 16) | (data[1] << 8) | data[2]
     return value - (1 << 24) if value & 0x800000 else value
 
 def status_from_frame(rx: list[int]) -> int:
     """Extract the 16-bit status value from a received frame."""
+    # the first two bytes of the received frame contain the adc status register value.
     return (rx[0] << 8) | rx[1]
 
 def channels_from_frame(rx: list[int]) -> list[int]:
     """Extract and sign-extend the three channel readings."""
+    # the adc payload stores three 24-bit signed samples in bytes 3 through 12 of the frame.
     return [
         signed24(rx[3:6]),
         signed24(rx[6:9]),
         signed24(rx[9:12]),
     ]
 
-# ==============================================================================
-# BACKGROUND ACQUISITION WORKER THREAD
-# ==============================================================================
+# background acquisition worker thread:
+# this thread continuously reads the adc, tracks positive-going crossings,
+# builds waveform blocks, calibrates the signal baseline, and raises warnings for drift.
 
 def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
     """Poll the ADC and update capture, calibration, and monitoring state."""
     try:
+        # issue a null command frame so the adc returns a live status response for startup checks.
         def null_frame() -> list[int]:
             return spi.xfer2(command_frame(0x0000))
 
-        # Flush stale pipeline data after configuration.
+        # flush stale pipeline data after configuration.
         null_frame()
         null_frame()
 
-        # Wait for the isolated-side supply fault flag to clear.
+        # wait for the isolated-side supply fault flag to clear before starting normal operation.
         deadline = time.monotonic() + 5.0
         status = 0
         device_ready = False
@@ -217,27 +248,34 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
 
         start_time = time.monotonic()
 
+        # keep polling the status and sample data until the shutdown signal is raised.
         while not stop_event.is_set():
+            # read the next spi response frame and decode the device status register.
             rx = null_frame()
             status = status_from_frame(rx)
 
+            # if the isolated-side fault flag is asserted, treat the device as unsafe and stop.
             if status & STATUS_SEC_FAIL:
                 raise RuntimeError(
                     f"ADC reported critical SEC_FAIL error: STATUS=0x{status:04X}"
                 )
 
+            # if all channel-ready bits are not set, skip the sample until valid conversion data exists.
             if (status & STATUS_READY_MASK) != STATUS_READY_MASK:
                 continue
 
+            # turn the raw signed adc words into engineering units in volts.
             raw = channels_from_frame(rx)
             volts = [value * VOLTS_PER_CODE for value in raw]
 
+            # calculate the sample timestamp and look for a positive-going zero crossing on ch0.
             sample_time = time.monotonic() - start_time
             ch0_volts = volts[0]
             is_zero_crossing = prev_voltage < 0.0 and ch0_volts >= 0.0
 
-            # Update frequency at every positive-going crossing.
+            # update the grid-frequency estimate whenever a new zero crossing is detected.
             if is_zero_crossing:
+                # if a previous crossing exists, compute the period and smooth it into the running estimate.
                 if prev_crossing_time is not None:
                     period = sample_time - prev_crossing_time
                     if 0.01 < period < 0.04:
@@ -246,6 +284,7 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
                             0.8 * current_frequency + 0.2 * measured_freq
                         )
 
+                # save the timestamp of the newest crossing for the next frequency calculation.
                 prev_crossing_time = sample_time
 
             # Start a block only if one is not already being captured.
@@ -374,17 +413,19 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
         logging.exception("Acquisition worker encountered an unexpected exception")
         stop_event.set()
 
-# ==============================================================================
-# MAIN APPLICATION AND VISUALIZATION CONTROLLER
-# ==============================================================================
+# main application and visualization controller:
+# this section initializes the gpio and spi hardware, starts the background worker,
+# and renders the live matplotlib plot with channel overlays, legends, and status text.
 
 def main() -> int:
+    # create the spi bus object and placeholders for the hardware control lines.
     spi = spidev.SpiDev()
     reset = None
     xen = None
     plot_fig = None
     acquisition_thread = None
 
+    # create the shutdown signal and the shared lock used by the worker thread and gui thread.
     stop_event = Event()
     data_lock = Lock()
 
@@ -445,8 +486,9 @@ def main() -> int:
         plot_fig, plot_ax = plt.subplots()
         plot_ax.set_xlabel("Time from Trigger (s)")
         plot_ax.set_ylabel("Voltage (V)")
-        plot_ax.set_title("AMC131M03 Zero-Crossing Overlay Persistence View")
-        plot_ax.grid(True)
+        plot_ax.set_title("AMC131M03 Zero-Crossing Overlay Multichannel Waveforms")
+        plot_ax.grid(True, color="#dfe6ee", linewidth=0.8)
+        plot_ax.set_axisbelow(True)
 
         overlay_lines = [[], [], []]
         colors = ["tab:blue", "tab:orange", "tab:green"]
@@ -471,26 +513,47 @@ def main() -> int:
                 )
                 overlay_lines[channel].append(line)
 
-        plot_ax.legend(loc="upper right")
+        channel_legend = plot_ax.legend(
+            handles=[overlay_lines[ch][-1] for ch in range(3)],
+            loc="lower right",
+            bbox_to_anchor=(1.0, 0.0),
+            ncol=1,
+            frameon=True,
+            fancybox=True,
+            shadow=True,
+            facecolor="white",
+            edgecolor="#ccd5df",
+            fontsize=9,
+            title="Channels",
+            title_fontsize=9,
+            handlelength=1.8,
+            handletextpad=0.5,
+            columnspacing=1.2,
+            borderpad=0.5,
+        )
+        plot_ax.add_artist(channel_legend)
         plot_ax.set_xlim(0.0, 0.10)
         plot_ax.set_ylim(-1.3, 1.3)
 
         rms_text = plot_ax.text(
-            0.98,
-            0.68,
-            "RMS Values: Collecting Sample Data...",
+            0.5,
+            0.02,
+            "Grid Frequency: Collecting Sample Data...\nCH0: Collecting...\nCH1: Collecting...\nCH2: Collecting...",
             transform=plot_ax.transAxes,
-            ha="right",
-            va="top",
-            fontsize=8,
+            ha="center",
+            va="bottom",
+            fontsize=8.5,
+            linespacing=1.3,
             bbox={
-                "facecolor": "white",
-                "alpha": 0.8,
-                "edgecolor": "none",
+                "boxstyle": "round,pad=0.45",
+                "facecolor": "#f8fafc",
+                "edgecolor": "#cbd5e1",
+                "linewidth": 1.0,
+                "alpha": 0.96,
             },
         )
 
-        plot_fig.tight_layout()
+        plot_fig.subplots_adjust(top=0.85, right=0.88, bottom=0.18)
         plot_fig.canvas.mpl_connect(
             "close_event",
             lambda _event: stop_event.set(),
@@ -506,10 +569,13 @@ def main() -> int:
 
         last_plot_update = time.monotonic()
 
+        # refresh the matplotlib plot on a fixed cadence without blocking the worker thread.
         while not stop_event.is_set():
             now = time.monotonic()
 
+            # redraw the plot only when enough time has elapsed to avoid unnecessary ui load.
             if now - last_plot_update >= PLOT_REFRESH_SECONDS:
+                # gather a stable snapshot of the live shared state while the worker thread is paused.
                 with data_lock:
                     local_blocks = list(shared_state["triggered_blocks"])
                     local_times = list(shared_state["times"])
@@ -520,6 +586,7 @@ def main() -> int:
                     local_crossings = list(shared_state["crossings"])
                     local_freq = shared_state["frequency"]
 
+                # paint the overlay waveform history for each channel using the most recent blocks.
                 if local_blocks:
                     for index in range(MAX_OVERLAY_BLOCKS):
                         for channel in range(3):
@@ -537,6 +604,7 @@ def main() -> int:
                     if newest_times:
                         plot_ax.set_xlim(0.0, newest_times[-1])
 
+                # initialize the summary text with the live frequency value before channel rms labels.
                 rms_rows = [
                     f"Grid Frequency: {local_freq:.2f} Hz "
                     f"(Persistence Mode)"
