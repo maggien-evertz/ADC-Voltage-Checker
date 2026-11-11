@@ -2,10 +2,9 @@
 """
 Read ISO ADC 7 / AMC131M03 voltage data on Raspberry Pi SPI0.
 
-A background thread polls SPI, tracks positive-going zero crossings, captures
-100-sample waveform blocks, calibrates AC RMS baselines, and detects EN 50160
-power quality events. Serves a live web dashboard featuring metrics, an embedded
-waveform plot, and a scrollable log viewer on port 5000.
+background thread polls SPI, tracks positive-going zero crossings, captures
+100-sample waveform blocks, calibrates AC RMS baselines, detects EN 50160
+power quality events. live web dashboard 172.17.223.251:5000.
 """
 
 from collections import deque
@@ -60,23 +59,15 @@ BASELINE_SAMPLES = 100
 RMS_CYCLES = 5
 PLOT_REFRESH_SECONDS = 0.1
 
-# Use absolute parent path to guarantee log.txt resides in the script's folder
 LOG_FILE = Path(__file__).resolve().parent / "log.txt"
 
+# Set logging level to ERROR so only exceptions and anomalies are recorded
 logging.basicConfig(
     filename=LOG_FILE,
     filemode="a",
-    level=logging.WARNING,
+    level=logging.ERROR,
     format="%(asctime)s %(levelname)s %(message)s",
 )
-
-# Ensure log.txt exists immediately upon startup so the web viewer can read it
-if not LOG_FILE.exists():
-    logging.warning(json.dumps({
-        "timestamp": datetime.now().astimezone().isoformat(timespec="milliseconds"),
-        "event": "SYSTEM_STARTUP",
-        "message": "Power quality analyzer and log viewer initialized successfully."
-    }))
 
 # ==============================================================================
 # mathematical calculations and utility functions:
@@ -119,7 +110,8 @@ def report_anomaly(reason, **details):
     }
     message = json.dumps(record, default=str)
     print(f"POWER QUALITY EVENT: {message}", flush=True)
-    logging.warning(message)
+    # Log anomalies as ERROR level so they are captured in log.txt
+    logging.error(message)
 
 def word24(word16: int) -> list[int]:
     return [(word16 >> 8) & 0xFF, word16 & 0xFF, 0]
@@ -323,6 +315,8 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
                         "frequency": current_frequency,
                         "ch0_rms": ch0_rms_val,
                         "ch1_rms": ch1_rms_val,
+                        "ch0_nom": baseline_rms[0] if baseline_rms else 0.0,
+                        "ch1_nom": baseline_rms[1] if baseline_rms else 0.0,
                     }
 
                 now = time.monotonic()
@@ -341,13 +335,13 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
 
 
 # ==============================================================================
-# LIGHTWEIGHT FLASK WEB DASHBOARD & LOG VIEWER SERVER
+# FLASK WEB DASHBOARD & LOG VIEWER SERVER
 # ==============================================================================
 
 dashboard_app = Flask(__name__)
 web_shared_state_ref = None
 
-DASHBOARD_HTML = """
+DASHBOARD_HTML = r"""
 <!DOCTYPE html>
 <html>
 <head>
@@ -360,9 +354,14 @@ DASHBOARD_HTML = """
         .metric-card { background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 6px; padding: 15px; text-align: center; }
         .metric-title { font-size: 13px; color: #64748b; font-weight: bold; text-transform: uppercase; }
         .metric-value { font-size: 22px; color: #0f172a; font-weight: bold; margin-top: 5px; }
+        .metric-sub { font-size: 12px; color: #475569; margin-top: 4px; }
         .section-box { background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 6px; padding: 15px; margin-bottom: 20px; text-align: center; }
         .section-box img { width: 100%; max-width: 800px; height: auto; border-radius: 4px; border: 1px solid #94a3b8; }
         .log-viewer { background: #0f172a; color: #38bdf8; font-family: monospace; font-size: 12px; padding: 12px; border-radius: 6px; height: 180px; overflow-y: scroll; text-align: left; border: 1px solid #334155; white-space: pre-wrap; word-break: break-all; }
+        .info-card { background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 6px; padding: 15px; margin-bottom: 20px; text-align: left; }
+        .info-card h3 { margin-top: 0; color: #1e40af; font-size: 15px; border-bottom: 1px solid #dbeafe; padding-bottom: 6px; }
+        .info-card ul { margin: 0; padding-left: 20px; font-size: 13px; color: #1e293b; line-height: 1.5; }
+        .info-card li { margin-bottom: 6px; }
     </style>
 </head>
 <body>
@@ -376,10 +375,12 @@ DASHBOARD_HTML = """
             <div class="metric-card">
                 <div class="metric-title">Channel 0 AC RMS</div>
                 <div class="metric-value" id="ch0-val">-- V</div>
+                <div class="metric-sub" id="ch0-nom">Nominal: Calibrating...</div>
             </div>
             <div class="metric-card">
                 <div class="metric-title">Channel 1 AC RMS</div>
                 <div class="metric-value" id="ch1-val">-- V</div>
+                <div class="metric-sub" id="ch1-nom">Nominal: Calibrating...</div>
             </div>
         </div>
         <div class="section-box">
@@ -388,7 +389,16 @@ DASHBOARD_HTML = """
         </div>
         <div class="section-box">
             <div class="metric-title" style="margin-bottom: 10px; text-align: left;">Event Log Viewer (log.txt)</div>
-            <div class="log-viewer" id="log-box">Loading event logs...</div>
+            <div class="log-viewer" id="log-box">Waiting for power quality events or anomalies...</div>
+        </div>
+        <div class="info-card">
+            <h3>EN 50160 Power Quality Disruption Criteria & Live Thresholds</h3>
+            <ul>
+                <li><strong>Nominal Baseline (V<sub>nom</sub>):</strong> Calibrated automatically from the initial 100 samples per channel (displayed live above).</li>
+                <li><strong>Voltage Sag (Dip):</strong> Logged when measured AC RMS drops between <strong>10% and 90%</strong> of nominal (0.10 &middot; V<sub>nom</sub> &le; V<sub>RMS</sub> &lt; 0.90 &middot; V<sub>nom</sub>).</li>
+                <li><strong>Voltage Swell:</strong> Logged when measured AC RMS rises above <strong>10%</strong> of nominal (V<sub>RMS</sub> &gt; 1.10 &middot; V<sub>nom</sub>).</li>
+                <li><strong>Voltage Interruption:</strong> Logged when measured AC RMS drops below <strong>10%</strong> of nominal (&lt; 0.10 &middot; V<sub>nom</sub>).</li>
+            </ul>
         </div>
     </div>
     <script>
@@ -400,6 +410,13 @@ DASHBOARD_HTML = """
                         document.getElementById('freq-val').innerText = data.frequency.toFixed(2) + ' Hz';
                         document.getElementById('ch0-val').innerText = data.ch0_rms.toFixed(4) + ' V';
                         document.getElementById('ch1-val').innerText = data.ch1_rms.toFixed(4) + ' V';
+                        
+                        if (data.ch0_nom) {
+                            document.getElementById('ch0-nom').innerText = 'Nominal (Vnom): ' + data.ch0_nom.toFixed(4) + ' V';
+                        }
+                        if (data.ch1_nom) {
+                            document.getElementById('ch1-nom').innerText = 'Nominal (Vnom): ' + data.ch1_nom.toFixed(4) + ' V';
+                        }
                     }
                 }).catch(err => console.error('Metrics fetch error:', err));
         }
@@ -408,15 +425,14 @@ DASHBOARD_HTML = """
             fetch('/api/logs')
                 .then(response => response.json())
                 .then(data => {
-                    if (data.logs) {
+                    if (data.logs && data.logs.length > 0) {
                         var logBox = document.getElementById('log-box');
-                        logBox.innerText = data.logs.join('\\n');
+                        logBox.innerText = data.logs.join('\n');
                         logBox.scrollTop = logBox.scrollHeight;
                     }
                 }).catch(err => console.error('Logs fetch error:', err));
         }
 
-        // Fetch immediately on load, then set intervals
         updateMetrics();
         updateLogs();
         setInterval(updateMetrics, 1000);
@@ -449,10 +465,12 @@ def api_logs():
         if LOG_FILE.exists():
             with open(LOG_FILE, "r") as f:
                 lines = f.readlines()
+                if not lines:
+                    return jsonify({"logs": ["Waiting for power quality events or anomalies..."]})
                 tail_lines = [line.strip() for line in lines[-50:]]
                 return jsonify({"logs": tail_lines})
         else:
-            return jsonify({"logs": ["No log.txt file found yet. Events will appear here when triggered."]})
+            return jsonify({"logs": ["Waiting for power quality events or anomalies..."]})
     except Exception as exc:
         return jsonify({"logs": [f"Error reading log file: {exc}"]})
 
@@ -469,6 +487,11 @@ def plot_png():
 def run_web_server(shared_state, data_lock):
     global web_shared_state_ref
     web_shared_state_ref = {"state": shared_state, "lock": data_lock}
+    
+    # silence Flask/Werkzeug HTTP access request logs in the console
+    log = logging.getLogger("werkzeug")
+    log.setLevel(logging.ERROR)
+    
     dashboard_app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
 
 
@@ -540,7 +563,6 @@ def main() -> int:
         )
         acquisition_thread.start()
 
-        # Start Flask web dashboard server in background thread
         web_thread = threading.Thread(
             target=run_web_server,
             args=(shared_state, data_lock),
@@ -549,7 +571,6 @@ def main() -> int:
         web_thread.start()
         print("Web dashboard server running at http://<pi-ip-address>:5000")
 
-        # Set up headless Matplotlib figure for image generation
         plot_fig, plot_ax = plt.subplots(figsize=(8, 4.5))
         plot_ax.set_xlabel("Time from Trigger (s)")
         plot_ax.set_ylabel("Voltage (V)")
