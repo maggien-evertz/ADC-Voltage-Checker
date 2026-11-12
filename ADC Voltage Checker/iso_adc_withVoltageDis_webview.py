@@ -49,7 +49,7 @@ REG_DCDC_CTRL = 0x31
 DCDC_FREQ_4P096_MHZ_AND_ENABLE = 0x0001
 
 STATUS_SEC_FAIL = 1 << 6            #status register bit 6 indicates critical SEC_FAIL error
-STATUS_READY_MASK = 0b111
+STATUS_READY_MASK = 0b011
 
 VOLTS_PER_CODE = 1.2 / (1 << 23)    # converts signed 24-bit ADC code to voltage (V) for AMC131M03 with 1.2V reference
 SAMPLING_RATE_HZ = 600.0
@@ -60,6 +60,8 @@ PRINT_INTERVAL = 0.5                # seconds between console printouts of curre
 BASELINE_SAMPLES = 100
 RMS_CYCLES = 5                      # number of zero-crossing cycles to use for AC RMS calculation (5 cycles at 60 Hz = 0.083 seconds)
 PLOT_REFRESH_SECONDS = 0.1
+STALE_TIMEOUT_SECONDS = 2.0
+CROSSING_TIMEOUT_SECONDS = 0.5
 
 LOG_FILE = Path(__file__).resolve().parent / "log.txt"
 
@@ -91,7 +93,7 @@ def report_anomaly(reason, **details):
     }
     message = json.dumps(record, default=str)
     print(f"POWER QUALITY EVENT: {message}", flush=True)
-    # Log anomalies as ERROR level so they are captured in log.txt
+    # Log anomalies as ERROR level so they are logged in log.txt
     logging.error(message)
 
 # pack 16-bit word into 3-byte list for SPI transfer
@@ -166,10 +168,16 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
         baseline_rms = None
         event_active = [None, None]
         last_print = 0.0
+        last_ready_warning = 0.0
+        last_metrics_update = float("-inf")
+        last_capture_publish = float("-inf")
+        last_accepted_monotonic = None
+        valid_sample_count = 0
+        last_ch2_voltage = math.nan
 
         prev_voltage = 0.0
         prev_crossing_time = None
-        current_frequency = 60.0
+        current_frequency = None
 
         capturing_triggered = False
         capture_start_time = None
@@ -183,18 +191,63 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
             rx = null_frame()
             status = status_from_frame(rx)
 
+            with data_lock:
+                shared_state["last_status"] = status
+
+            if ((status >> 8) & 0b11) != 0b01:
+                raise RuntimeError(f"Unexpected STATUS 0x{status:04X}; check SPI wiring.")
+
             if status & STATUS_SEC_FAIL:
                 raise RuntimeError(f"ADC reported critical SEC_FAIL error: STATUS=0x{status:04X}")
 
             if (status & STATUS_READY_MASK) != STATUS_READY_MASK:
+                now = time.monotonic()
+                if now - last_ready_warning >= PRINT_INTERVAL:
+                    print(
+                        f"Waiting for CH0/CH1 data: STATUS=0x{status:04X}, "
+                        f"ready bits=0b{status & 0b111:03b}",
+                        flush=True,
+                    )
+                    last_ready_warning = now
+                stop_event.wait(0.0005)
                 continue
 
+            sample_wall_time = time.monotonic()
+            if (
+                last_accepted_monotonic is not None
+                and sample_wall_time - last_accepted_monotonic > CROSSING_TIMEOUT_SECONDS
+            ):
+                capturing_triggered = False
+                capture_start_time = None
+                temp_triggered_times = []
+                temp_triggered_vals = [[], [], []]
+                prev_voltage = 0.0
+                prev_crossing_time = None
+                current_frequency = None
+                for window in calibration_windows:
+                    window.clear()
+                with data_lock:
+                    shared_state["triggered_blocks"].clear()
+                    shared_state["current_block"] = None
+                    shared_state["last_crossing_monotonic"] = None
+                    shared_state["times"].clear()
+                    shared_state["crossings"].clear()
+                    for channel_values in shared_state["values"]:
+                        channel_values.clear()
+
+            last_accepted_monotonic = sample_wall_time
+            valid_sample_count += 1
             raw = channels_from_frame(rx)
             volts = [value * VOLTS_PER_CODE for value in raw]
+            if status & 0b100:
+                last_ch2_voltage = volts[2]
+            volts[2] = last_ch2_voltage
 
-            sample_time = time.monotonic() - start_time
+            sample_time = sample_wall_time - start_time
             ch0_volts = volts[0]
-            is_zero_crossing = prev_voltage < 0.0 and ch0_volts >= 0.0  # detect positive-going zero crossing on channel 0
+            
+            # detect positive-going zero crossing at 0.0V
+            is_zero_crossing = prev_voltage < 0.0 and ch0_volts >= 0.0
 
             # update frequency estimate based on zero crossings
             if is_zero_crossing:
@@ -202,17 +255,19 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
                     period = sample_time - prev_crossing_time
                     if 0.01 < period < 0.04:
                         measured_freq = 1.0 / period
-                        current_frequency = (0.8 * current_frequency + 0.2 * measured_freq)
+                        current_frequency = (
+                            measured_freq if current_frequency is None
+                            else 0.8 * current_frequency + 0.2 * measured_freq
+                        )
                 prev_crossing_time = sample_time
 
-            # capture triggered waveform blocks
+            # capture triggered waveform blocks (also fallback to continuous capture if zero-crossing takes a moment)
             if is_zero_crossing and not capturing_triggered:
                 capturing_triggered = True
                 capture_start_time = sample_time
                 temp_triggered_times = [0.0]
                 temp_triggered_vals = [[volts[0]], [volts[1]], [volts[2]]]
 
-            # if currently capturing a triggered block, append samples until buffer is full
             elif capturing_triggered:
                 temp_triggered_times.append(sample_time - capture_start_time)
                 for channel, value in enumerate(volts):
@@ -234,19 +289,22 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
 
             # update shared state with latest sample data, frequency, and zero crossing events
             prev_voltage = ch0_volts
-            sample_wall_time = time.monotonic()
             
-            # update shared state with latest sample data, frequency, and zero crossing events
             with data_lock:
                 shared_state["times"].append(sample_time)
                 shared_state["frequency"] = current_frequency
                 shared_state["last_sample_monotonic"] = sample_wall_time
+                shared_state["valid_sample_count"] = valid_sample_count
 
                 if is_zero_crossing:
                     shared_state["crossings"].append(sample_time)
                     shared_state["last_crossing_monotonic"] = sample_wall_time
 
-                if capturing_triggered:
+                if capturing_triggered and (
+                    is_zero_crossing
+                    or sample_wall_time - last_capture_publish >= PLOT_REFRESH_SECONDS
+                ):
+                    last_capture_publish = sample_wall_time
                     shared_state["current_block"] = {
                         "times": list(temp_triggered_times),
                         "values": [list(cv) for cv in temp_triggered_vals],
@@ -263,24 +321,25 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
                 while shared_state["crossings"] and sample_time - shared_state["crossings"][0] > 1.0:
                     shared_state["crossings"].popleft()
 
-            # perform baseline calibration and power quality event detection after initial discard period
+            # feed calibration windows
             if discard:
                 discard -= 1
+                continue
 
-            elif baseline_rms is None:
-                for channel in range(2):
-                    calibration_windows[channel].append(volts[channel])
+            for channel in range(2):
+                calibration_windows[channel].append(volts[channel])
 
-                # once both calibration windows are full, compute the AC RMS baseline for each channel
-                if all(len(window) == BASELINE_SAMPLES for window in calibration_windows):
+            if sample_wall_time - last_metrics_update < PLOT_REFRESH_SECONDS:
+                continue
+            last_metrics_update = sample_wall_time
+
+            if baseline_rms is None:
+                if all(len(window) >= BASELINE_SAMPLES for window in calibration_windows):
                     baseline_rms = [ac_rms_from_volts(list(window)) for window in calibration_windows]
                     print(f"AC RMS baseline calibrated: CH0={baseline_rms[0]:.4f}V, CH1={baseline_rms[1]:.4f}V")
-            
-            # after calibration, compute AC RMS for each channel and detect power quality events based on EN 50160 criteria
             else:
                 for channel in range(2):
                     window = calibration_windows[channel]
-                    window.append(volts[channel])
                     measured_rms = ac_rms_from_volts(list(window))
 
                     if measured_rms is None or baseline_rms[channel] is None:
@@ -289,7 +348,6 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
                     v_nom = baseline_rms[channel]
                     ratio = measured_rms / v_nom if v_nom > 0 else 1.0
 
-                    # determine the current power quality event based on the measured RMS ratio
                     current_event = None
                     if ratio < 0.10:
                         current_event = "INTERRUPTION"
@@ -298,7 +356,6 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
                     elif ratio > 1.10:
                         current_event = "VOLT_SWELL"
 
-                    # if the current event differs from the last recorded event for this channel, log anomaly and update the active event
                     if current_event != event_active[channel]:
                         if current_event is not None:
                             report_anomaly(
@@ -310,30 +367,29 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
                             )
                         event_active[channel] = current_event
 
-                # update shared state with latest metrics for web dashboard
-                ch0_rms_val = ac_rms_from_volts(list(calibration_windows[0])) or 0.0
-                ch1_rms_val = ac_rms_from_volts(list(calibration_windows[1])) or 0.0
+            # continuously update dashboard metrics so numbers show up immediately
+            ch0_rms_val = ac_rms_from_volts(list(calibration_windows[0])) or 0.0
+            ch1_rms_val = ac_rms_from_volts(list(calibration_windows[1])) or 0.0
 
-                # update shared state with latest metrics for web dashboard
-                with data_lock:
-                    shared_state["latest_metrics"] = {
-                        "frequency": current_frequency,
-                        "ch0_rms": ch0_rms_val,
-                        "ch1_rms": ch1_rms_val,
-                        "ch0_nom": baseline_rms[0] if baseline_rms else 0.0,
-                        "ch1_nom": baseline_rms[1] if baseline_rms else 0.0,
-                    }
+            with data_lock:
+                shared_state["latest_metrics"] = {
+                    "frequency": current_frequency,
+                    "ch0_rms": ch0_rms_val,
+                    "ch1_rms": ch1_rms_val,
+                    "ch0_nom": baseline_rms[0] if baseline_rms else None,
+                    "ch1_nom": baseline_rms[1] if baseline_rms else None,
+                    "calibrated": baseline_rms is not None,
+                }
 
-                # periodically print current status and voltage readings to console
-                now = time.monotonic()
-                if now - last_print >= PRINT_INTERVAL:
-                    print(
-                        f"Status=0x{status:04X}  Freq={current_frequency:.2f}Hz  "
-                        f"CH0={volts[0]:+.4f}V  CH1={volts[1]:+.4f}V  CH2={volts[2]:+.4f}V"
-                    )
-                    last_print = now
+            now = time.monotonic()
+            if now - last_print >= PRINT_INTERVAL:
+                print(
+                    f"Status=0x{status:04X}  Freq="
+                    f"{format(current_frequency, '.2f') if current_frequency is not None else '--'}Hz  "
+                    f"CH0={volts[0]:+.4f}V  CH1={volts[1]:+.4f}V  CH2={volts[2]:+.4f}V"
+                )
+                last_print = now
     
-    # handle any exceptions raised in the acquisition worker thread, log the error, and update shared state with the error message
     except Exception as exc:
         with data_lock:
             shared_state["worker_error"] = str(exc)
@@ -350,31 +406,75 @@ web_shared_state_ref = None
 
 DASHBOARD_HTML = r"""
 <!DOCTYPE html>
-<html>
+<html data-theme="light">
 <head>
     <title>ISO ADC 7 Power Quality Dashboard</title>
     <style>
-        body { font-family: Arial, sans-serif; background: #f0f2f5; margin: 0; padding: 20px; color: #333; }
-        .container { max-width: 900px; margin: auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        h1 { color: #1d4ed8; font-size: 24px; border-bottom: 2px solid #e5e7eb; padding-bottom: 10px; margin-top: 0; }
+        :root {
+            --bg-color: #f0f2f5;
+            --card-bg: #ffffff;
+            --text-color: #333333;
+            --heading-color: #1d4ed8;
+            --border-color: #cbd5e1;
+            --sub-text: #64748b;
+            --val-color: #0f172a;
+            --box-bg: #f8fafc;
+            --info-bg: #eff6ff;
+            --info-border: #bfdbfe;
+            --info-text: #1e293b;
+            --info-heading: #1e40af;
+            --btn-bg: #e2e8f0;
+            --btn-hover: #cbd5e1;
+            --btn-text: #1e293b;
+        }
+        [data-theme="dark"] {
+            --bg-color: #0f172a;
+            --card-bg: #1e293b;
+            --text-color: #f1f5f9;
+            --heading-color: #38bdf8;
+            --border-color: #334155;
+            --sub-text: #94a3b8;
+            --val-color: #f8fafc;
+            --box-bg: #090d16;
+            --info-bg: #172554;
+            --info-border: #1e40af;
+            --info-text: #e2e8f0;
+            --info-heading: #60a5fa;
+            --btn-bg: #334155;
+            --btn-hover: #475569;
+            --btn-text: #f8fafc;
+        }
+        body { font-family: Arial, sans-serif; background: var(--bg-color); margin: 0; padding: 20px; color: var(--text-color); transition: background 0.3s, color 0.3s; }
+        .container { max-width: 900px; margin: auto; background: var(--card-bg); padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); transition: background 0.3s; }
+        .header-row { display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid var(--border-color); padding-bottom: 10px; margin-top: 0; margin-bottom: 20px; }
+        h1 { color: var(--heading-color); font-size: 24px; margin: 0; }
+        .theme-btn { background: var(--btn-bg); color: var(--btn-text); border: 1px solid var(--border-color); padding: 8px 14px; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 13px; transition: background 0.2s; }
+        .theme-btn:hover { background: var(--btn-hover); }
         .metrics-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin-bottom: 20px; }
-        .metric-card { background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 6px; padding: 15px; text-align: center; }
-        .metric-title { font-size: 13px; color: #64748b; font-weight: bold; text-transform: uppercase; }
-        .metric-value { font-size: 22px; color: #0f172a; font-weight: bold; margin-top: 5px; }
-        .metric-sub { font-size: 12px; color: #475569; margin-top: 4px; }
-        .section-box { background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 6px; padding: 15px; margin-bottom: 20px; text-align: center; }
-        .section-box img { width: 100%; max-width: 800px; height: auto; border-radius: 4px; border: 1px solid #94a3b8; }
-        .log-viewer { background: #0f172a; color: #38bdf8; font-family: monospace; font-size: 12px; padding: 12px; border-radius: 6px; height: 180px; overflow-y: scroll; text-align: left; border: 1px solid #334155; white-space: pre-wrap; word-break: break-all; }
-        .info-card { background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 6px; padding: 15px; margin-bottom: 20px; text-align: left; }
-        .info-card h3 { margin-top: 0; color: #1e40af; font-size: 15px; border-bottom: 1px solid #dbeafe; padding-bottom: 6px; }
-        .info-card ul { margin: 0; padding-left: 20px; font-size: 13px; color: #1e293b; line-height: 1.5; }
+        .metric-card { background: var(--box-bg); border: 1px solid var(--border-color); border-radius: 6px; padding: 15px; text-align: center; }
+        .metric-title { font-size: 13px; color: var(--sub-text); font-weight: bold; text-transform: uppercase; }
+        .metric-value { font-size: 22px; color: var(--val-color); font-weight: bold; margin-top: 5px; }
+        .metric-sub { font-size: 12px; color: var(--sub-text); margin-top: 4px; }
+        .acquisition-status { padding: 10px 12px; margin-bottom: 16px; border: 1px solid var(--border-color); border-radius: 6px; background: var(--box-bg); color: var(--text-color); font-size: 13px; white-space: pre-wrap; }
+        .acquisition-status.error { border-width: 2px; font-weight: bold; }
+        .metrics-grid.stale .metric-value { opacity: 0.55; }
+        .section-box { background: var(--box-bg); border: 1px solid var(--border-color); border-radius: 6px; padding: 15px; margin-bottom: 20px; text-align: center; }
+        .section-box img { width: 100%; max-width: 800px; height: auto; border-radius: 4px; border: 1px solid var(--border-color); }
+        .log-viewer { background: #090d16; color: #38bdf8; font-family: monospace; font-size: 12px; padding: 12px; border-radius: 6px; height: 180px; overflow-y: scroll; text-align: left; border: 1px solid #334155; white-space: pre-wrap; word-break: break-all; }
+        .info-card { background: var(--info-bg); border: 1px solid var(--info-border); border-radius: 6px; padding: 15px; margin-bottom: 20px; text-align: left; }
+        .info-card h3 { margin-top: 0; color: var(--info-heading); font-size: 15px; border-bottom: 1px solid var(--info-border); padding-bottom: 6px; }
+        .info-card ul { margin: 0; padding-left: 20px; font-size: 13px; color: var(--info-text); line-height: 1.5; }
         .info-card li { margin-bottom: 6px; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>AMC131M03 Power Quality Dashboard</h1>
-        <div class="metrics-grid">
+        <div class="header-row">
+            <h1>AMC131M03 Power Quality Dashboard</h1>
+            <button class="theme-btn" id="theme-toggle" onclick="toggleTheme()">Switch to Dark Mode</button>
+        </div>
+        <div class="acquisition-status" id="acquisition-status">Waiting for ADC data...</div>
+        <div class="metrics-grid" id="metrics-grid">
             <div class="metric-card">
                 <div class="metric-title">Grid Frequency</div>
                 <div class="metric-value" id="freq-val">-- Hz</div>
@@ -409,25 +509,83 @@ DASHBOARD_HTML = r"""
         </div>
     </div>
     <script>
-        function updateMetrics() {
-            fetch('/api/status')
-                .then(response => response.json())
-                .then(data => {
-                    if (data.frequency !== undefined) {
-                        document.getElementById('freq-val').innerText = data.frequency.toFixed(2) + ' Hz';
-                        document.getElementById('ch0-val').innerText = data.ch0_rms.toFixed(4) + ' V';
-                        document.getElementById('ch1-val').innerText = data.ch1_rms.toFixed(4) + ' V';
-                        
-                        if (data.ch0_nom) {
-                            document.getElementById('ch0-nom').innerText = 'Nominal (Vnom): ' + data.ch0_nom.toFixed(4) + ' V';
-                        }
-                        if (data.ch1_nom) {
-                            document.getElementById('ch1-nom').innerText = 'Nominal (Vnom): ' + data.ch1_nom.toFixed(4) + ' V';
-                        }
-                    }
-                }).catch(err => console.error('Metrics fetch error:', err));
+        function toggleTheme() {
+            const html = document.documentElement;
+            const btn = document.getElementById('theme-toggle');
+            if (html.getAttribute('data-theme') === 'light') {
+                html.setAttribute('data-theme', 'dark');
+                btn.innerText = 'Switch to Light Mode';
+                try { localStorage.setItem('theme', 'dark'); } catch (_) {}
+            } else {
+                html.setAttribute('data-theme', 'light');
+                btn.innerText = 'Switch to Dark Mode';
+                try { localStorage.setItem('theme', 'light'); } catch (_) {}
+            }
         }
-        
+
+        // Load saved theme preference on page load
+        window.addEventListener('DOMContentLoaded', () => {
+            let savedTheme = 'light';
+            try { savedTheme = localStorage.getItem('theme') || 'light'; } catch (_) {}
+            document.documentElement.setAttribute('data-theme', savedTheme);
+            document.getElementById('theme-toggle').innerText = savedTheme === 'dark' ? 'Switch to Light Mode' : 'Switch to Dark Mode';
+        });
+
+        async function updateMetrics() {
+            const status = document.getElementById('acquisition-status');
+            const grid = document.getElementById('metrics-grid');
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 5000);
+            try {
+                const response = await fetch('/api/status', {
+                    cache: 'no-store', signal: controller.signal
+                });
+                if (!response.ok) throw new Error('HTTP ' + response.status);
+                const data = await response.json();
+                grid.classList.toggle('stale', data.is_stale || Boolean(data.worker_error));
+                status.className = 'acquisition-status';
+
+                const statusHex = Number.isInteger(data.last_status)
+                    ? ' | STATUS=0x' + data.last_status.toString(16).toUpperCase().padStart(4, '0')
+                    : '';
+                if (data.worker_error) {
+                    status.classList.add('error');
+                    status.innerText = 'Acquisition error: ' + data.worker_error +
+                        '. Readings and waveform are held, not live.';
+                } else if (data.is_stale) {
+                    status.innerText = 'No fresh CH0/CH1 samples. Holding the last readings.' + statusHex;
+                } else {
+                    status.innerText = 'Live CH0/CH1 samples: ' + data.valid_sample_count +
+                        statusHex + '\n' + data.waveform_state;
+                }
+                if (data.plot_error) {
+                    status.classList.add('error');
+                    status.innerText += '\nWaveform rendering error: ' + data.plot_error;
+                }
+
+                document.getElementById('freq-val').innerText =
+                    Number.isFinite(data.frequency) ? data.frequency.toFixed(2) + ' Hz' : '-- Hz';
+                for (const channel of [0, 1]) {
+                    const rms = data['ch' + channel + '_rms'];
+                    const nominal = data['ch' + channel + '_nom'];
+                    if (Number.isFinite(rms)) {
+                        document.getElementById('ch' + channel + '-val').innerText = rms.toFixed(4) + ' V';
+                    }
+                    document.getElementById('ch' + channel + '-nom').innerText =
+                        Number.isFinite(nominal)
+                            ? 'Nominal (Vnom): ' + nominal.toFixed(4) + ' V'
+                            : 'Nominal: Calibrating...';
+                }
+            } catch (err) {
+                grid.classList.add('stale');
+                status.className = 'acquisition-status error';
+                status.innerText = 'Dashboard connection failed; displayed data may be stale: ' + err.message;
+            } finally {
+                clearTimeout(timeout);
+                setTimeout(updateMetrics, 500);
+            }
+        }
+
         function updateLogs() {
             fetch('/api/logs')
                 .then(response => response.json())
@@ -442,13 +600,22 @@ DASHBOARD_HTML = r"""
 
         updateMetrics();
         updateLogs();
-        setInterval(updateMetrics, 1000);
         setInterval(updateLogs, 2000);
 
-        setInterval(function() {
-            var img = document.getElementById('waveform-img');
-            img.src = '/plot.png?t=' + new Date().getTime();
-        }, 300);
+        function refreshWaveform() {
+            const next = new Image();
+            next.onload = function() {
+                next.id = 'waveform-img';
+                next.alt = 'Live Waveform';
+                document.getElementById('waveform-img').replaceWith(next);
+                setTimeout(refreshWaveform, 500);
+            };
+            next.onerror = function() {
+                setTimeout(refreshWaveform, 1000);
+            };
+            next.src = '/plot.png?t=' + Date.now();
+        }
+        refreshWaveform();
     </script>
 </body>
 </html>
@@ -463,8 +630,11 @@ def api_status():
     global web_shared_state_ref
     if web_shared_state_ref:
         with web_shared_state_ref["lock"]:
-            return jsonify(web_shared_state_ref["state"].get("latest_metrics", {}))
-    return jsonify({"error": "Initializing"})
+            payload = build_status_payload(web_shared_state_ref["state"], time.monotonic())
+        response = jsonify(payload)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    return jsonify({"error": "Initializing", "is_stale": True})
 
 @dashboard_app.route("/api/logs")
 def api_logs():
@@ -488,8 +658,11 @@ def plot_png():
         with web_shared_state_ref["lock"]:
             img_bytes = web_shared_state_ref["state"].get("plot_image_bytes")
             if img_bytes:
-                return Response(img_bytes, mimetype="image/png")
-    return "Generating...", 200
+                return Response(
+                    img_bytes, mimetype="image/png",
+                    headers={"Cache-Control": "no-store"},
+                )
+    return "Generating...", 503
 
 def run_web_server(shared_state, data_lock):
     global web_shared_state_ref
@@ -506,6 +679,92 @@ def run_web_server(shared_state, data_lock):
 # MAIN, WEB SERVER & PLOT GENERATOR
 # ==============================================================================
 
+def create_shared_state():
+    return {
+        "times": deque(),
+        "values": [deque(), deque(), deque()],
+        "crossings": deque(),
+        "triggered_blocks": deque(maxlen=AVERAGE_BLOCK_COUNT),
+        "current_block": None,
+        "last_sample_monotonic": None,
+        "last_crossing_monotonic": None,
+        "frequency": None,
+        "latest_metrics": {},
+        "plot_image_bytes": None,
+        "worker_error": None,
+        "plot_error": None,
+        "last_status": None,
+        "valid_sample_count": 0,
+        "waveform_state": "Waiting for ADC data...",
+    }
+
+
+def build_status_payload(state, now):
+    payload = dict(state.get("latest_metrics", {}))
+    last_sample = state.get("last_sample_monotonic")
+    last_crossing = state.get("last_crossing_monotonic")
+    age = now - last_sample if last_sample is not None else None
+    crossing_age = now - last_crossing if last_crossing is not None else None
+    payload.update({
+        "sample_age_s": age,
+        "is_stale": age is None or age > STALE_TIMEOUT_SECONDS,
+        "worker_error": state.get("worker_error"),
+        "plot_error": state.get("plot_error"),
+        "last_status": state.get("last_status"),
+        "valid_sample_count": state.get("valid_sample_count", 0),
+        "waveform_state": state.get("waveform_state", "Waiting for ADC data..."),
+    })
+    if payload["is_stale"] or crossing_age is None or crossing_age > CROSSING_TIMEOUT_SECONDS:
+        payload["frequency"] = None
+    return payload
+
+
+def update_waveform_plot(plot_ax, average_lines, snapshot, now):
+    last_sample = snapshot["last_sample_monotonic"]
+    if snapshot["worker_error"]:
+        return "Acquisition error; holding last waveform"
+    if last_sample is None or now - last_sample > STALE_TIMEOUT_SECONDS:
+        return "Waiting for fresh CH0/CH1 samples; holding last waveform"
+
+    last_crossing = snapshot["last_crossing_monotonic"]
+    recent_crossing = last_crossing is not None and now - last_crossing <= CROSSING_TIMEOUT_SECONDS
+    blocks = list(snapshot["triggered_blocks"])
+    current = snapshot["current_block"]
+    if current and current["times"]:
+        blocks.append(current)
+    blocks = blocks[-AVERAGE_BLOCK_COUNT:]
+
+    if blocks and recent_crossing:
+        sample_count = max(len(block["times"]) for block in blocks)
+        average_times = []
+        average_values = [[], [], []]
+        for index in range(sample_count):
+            contributors = [block for block in blocks if index < len(block["times"])]
+            average_times.append(sum(block["times"][index] for block in contributors) / len(contributors))
+            for channel in range(3):
+                values = [block["values"][channel][index] for block in contributors]
+                values = [value for value in values if math.isfinite(value)]
+                average_values[channel].append(sum(values) / len(values) if values else math.nan)
+        for channel in range(3):
+            average_lines[channel].set_data(average_times, average_values[channel])
+        plot_ax.set_xlabel("Time from Trigger (s)")
+        plot_ax.set_xlim(0.0, max(average_times[-1], 0.01))
+        return f"Zero-crossing average: {len(blocks)} blocks; CH2 held between its fresh readings"
+
+    if blocks:
+        return "No recent CH0 zero crossings; holding last triggered waveform (RMS still live)"
+
+    times = snapshot["times"][-TRIGGER_BUFFER_SIZE:]
+    if times:
+        relative_times = [value - times[0] for value in times]
+        for channel in range(3):
+            values = snapshot["values"][channel][-len(times):]
+            average_lines[channel].set_data(relative_times, values)
+        plot_ax.set_xlabel("Time within live preview (s)")
+        plot_ax.set_xlim(0.0, max(relative_times[-1], 0.01))
+    return "Live preview (not averaged): waiting for a CH0 positive-going zero crossing"
+
+
 def main() -> int:
     spi = spidev.SpiDev()
     reset = None
@@ -517,19 +776,7 @@ def main() -> int:
     data_lock = Lock()
 
     # shared state dictionary to hold acquisition data, metrics, and plot image bytes for web dash
-    shared_state = {
-        "times": deque(),
-        "values": [deque(), deque(), deque()],
-        "crossings": deque(),
-        "triggered_blocks": deque(maxlen=AVERAGE_BLOCK_COUNT),
-        "current_block": None,
-        "last_sample_monotonic": None,
-        "last_crossing_monotonic": None,
-        "frequency": 60.0,
-        "latest_metrics": {},
-        "plot_image_bytes": None,
-        "worker_error": None,
-    }
+    shared_state = create_shared_state()
 
     def request_shutdown(_signum, _frame):
         stop_event.set()
@@ -593,6 +840,11 @@ def main() -> int:
             line, = plot_ax.plot([], [], color=color, linewidth=1.5, label=f"CH{channel}")
             average_lines.append(line)
 
+        average_lines[2].set_label("CH2 (last received)")
+        plot_status = plot_ax.text(
+            0.01, 0.02, "Waiting for ADC data...", transform=plot_ax.transAxes,
+            fontsize=8, va="bottom", wrap=True,
+        )
         plot_ax.legend(loc="upper right", fontsize=9)
         plot_ax.set_xlim(0.0, 0.10)
         plot_ax.set_ylim(-1.3, 1.3)
@@ -606,41 +858,33 @@ def main() -> int:
 
             if now - last_plot_update >= PLOT_REFRESH_SECONDS:
                 with data_lock:
-                    local_blocks = list(shared_state["triggered_blocks"])
-                    local_current_block = shared_state["current_block"]
-                    local_values = [list(cv) for cv in shared_state["values"]]
-                    local_crossings = list(shared_state["crossings"])
-                    local_freq = shared_state["frequency"]
-                    local_worker_error = shared_state["worker_error"]
+                    snapshot = {
+                        "triggered_blocks": list(shared_state["triggered_blocks"]),
+                        "current_block": shared_state["current_block"],
+                        "times": list(shared_state["times"]),
+                        "values": [list(cv) for cv in shared_state["values"]],
+                        "last_sample_monotonic": shared_state["last_sample_monotonic"],
+                        "last_crossing_monotonic": shared_state["last_crossing_monotonic"],
+                        "worker_error": shared_state["worker_error"],
+                    }
 
-                blocks_to_average = list(local_blocks)
-                if local_current_block and local_current_block["times"]:
-                    blocks_to_average.append(local_current_block)
-
-                if blocks_to_average:
-                    sample_count = max(len(block["times"]) for block in blocks_to_average)
-                    average_times = []
-                    average_values = [[], [], []]
-
-                    for sample_index in range(sample_count):
-                        contributors = [b for b in blocks_to_average if sample_index < len(b["times"])]
-                        average_times.append(sum(b["times"][sample_index] for b in contributors) / len(contributors))
-                        for channel in range(3):
-                            average_values[channel].append(
-                                sum(b["values"][channel][sample_index] for b in contributors) / len(contributors)
-                            )
-
-                    for channel in range(3):
-                        average_lines[channel].set_data(average_times, average_values[channel])
-
-                    plot_ax.set_xlim(0.0, max(average_times[-1] if average_times else 0.10, 0.01))
-
-                buf = io.BytesIO()
-                plot_fig.savefig(buf, format="png", bbox_inches="tight", dpi=100)
-                buf.seek(0)
-                
-                with data_lock:
-                    shared_state["plot_image_bytes"] = buf.getvalue()
+                try:
+                    mode = update_waveform_plot(plot_ax, average_lines, snapshot, now)
+                    plot_status.set_text(mode)
+                    with io.BytesIO() as buf:
+                        plot_fig.savefig(buf, format="png", dpi=100)
+                        image_bytes = buf.getvalue()
+                    with data_lock:
+                        shared_state["plot_image_bytes"] = image_bytes
+                        shared_state["waveform_state"] = mode
+                        shared_state["plot_error"] = None
+                except Exception as exc:
+                    with data_lock:
+                        previous_error = shared_state["plot_error"]
+                        shared_state["plot_error"] = str(exc)
+                    if str(exc) != previous_error:
+                        logging.exception("Waveform rendering exception")
+                        print(f"Waveform rendering error: {exc}", file=sys.stderr)
 
                 last_plot_update = now
 
