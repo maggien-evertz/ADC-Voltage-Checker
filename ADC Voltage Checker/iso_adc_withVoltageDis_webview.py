@@ -455,8 +455,6 @@ DASHBOARD_HTML = r"""
         .metric-title { font-size: 13px; color: var(--sub-text); font-weight: bold; text-transform: uppercase; }
         .metric-value { font-size: 22px; color: var(--val-color); font-weight: bold; margin-top: 5px; }
         .metric-sub { font-size: 12px; color: var(--sub-text); margin-top: 4px; }
-        .acquisition-status { padding: 10px 12px; margin-bottom: 16px; border: 1px solid var(--border-color); border-radius: 6px; background: var(--box-bg); color: var(--text-color); font-size: 13px; white-space: pre-wrap; }
-        .acquisition-status.error { border-width: 2px; font-weight: bold; }
         .metrics-grid.stale .metric-value { opacity: 0.55; }
         .section-box { background: var(--box-bg); border: 1px solid var(--border-color); border-radius: 6px; padding: 15px; margin-bottom: 20px; text-align: center; }
         .section-box img { width: 100%; max-width: 800px; height: auto; border-radius: 4px; border: 1px solid var(--border-color); }
@@ -473,7 +471,6 @@ DASHBOARD_HTML = r"""
             <h1>AMC131M03 Power Quality Dashboard</h1>
             <button class="theme-btn" id="theme-toggle" onclick="toggleTheme()">Switch to Dark Mode</button>
         </div>
-        <div class="acquisition-status" id="acquisition-status">Waiting for ADC data...</div>
         <div class="metrics-grid" id="metrics-grid">
             <div class="metric-card">
                 <div class="metric-title">Grid Frequency</div>
@@ -532,7 +529,6 @@ DASHBOARD_HTML = r"""
         });
 
         async function updateMetrics() {
-            const status = document.getElementById('acquisition-status');
             const grid = document.getElementById('metrics-grid');
             const controller = new AbortController();
             const timeout = setTimeout(() => controller.abort(), 5000);
@@ -543,25 +539,6 @@ DASHBOARD_HTML = r"""
                 if (!response.ok) throw new Error('HTTP ' + response.status);
                 const data = await response.json();
                 grid.classList.toggle('stale', data.is_stale || Boolean(data.worker_error));
-                status.className = 'acquisition-status';
-
-                const statusHex = Number.isInteger(data.last_status)
-                    ? ' | STATUS=0x' + data.last_status.toString(16).toUpperCase().padStart(4, '0')
-                    : '';
-                if (data.worker_error) {
-                    status.classList.add('error');
-                    status.innerText = 'Acquisition error: ' + data.worker_error +
-                        '. Readings and waveform are held, not live.';
-                } else if (data.is_stale) {
-                    status.innerText = 'No fresh CH0/CH1 samples. Holding the last readings.' + statusHex;
-                } else {
-                    status.innerText = 'Live CH0/CH1 samples: ' + data.valid_sample_count +
-                        statusHex + '\n' + data.waveform_state;
-                }
-                if (data.plot_error) {
-                    status.classList.add('error');
-                    status.innerText += '\nWaveform rendering error: ' + data.plot_error;
-                }
 
                 document.getElementById('freq-val').innerText =
                     Number.isFinite(data.frequency) ? data.frequency.toFixed(2) + ' Hz' : '-- Hz';
@@ -578,8 +555,6 @@ DASHBOARD_HTML = r"""
                 }
             } catch (err) {
                 grid.classList.add('stale');
-                status.className = 'acquisition-status error';
-                status.innerText = 'Dashboard connection failed; displayed data may be stale: ' + err.message;
             } finally {
                 clearTimeout(timeout);
                 setTimeout(updateMetrics, 500);
