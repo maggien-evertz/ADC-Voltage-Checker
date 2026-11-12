@@ -9,6 +9,9 @@ power quality events. live web dashboard 172.17.223.251:5000.
 
 from collections import deque
 from datetime import datetime
+from flask import Flask, jsonify, render_template_string, Response
+from gpiozero import DigitalOutputDevice
+
 import io
 import json
 import logging
@@ -19,13 +22,12 @@ import sys
 import threading
 from threading import Event, Lock
 import time
+import spidev
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from flask import Flask, jsonify, render_template_string, Response
-from gpiozero import DigitalOutputDevice
-import spidev
+
 
 # ==============================================================================
 # hardware and spi configuration parameters:
@@ -38,30 +40,30 @@ XEN_BCM = 25
 
 SPI_MODE = 0b01
 SPI_HZ = 500_000
-FRAME_WORDS = 5
+FRAME_WORDS = 5                     #each adc frame has 5 words (3 bytes/24-bits each) for 15 bytes total
 FRAME_BYTES = FRAME_WORDS * 3
 
 REG_CLOCK = 0x03
-CLOCK_600_SPS = 0x0716
+CLOCK_600_SPS = 0x0716              #600 Samples/sec, 4.096 MHz internal clock, 50 Hz notch filter enabled
 REG_DCDC_CTRL = 0x31
 DCDC_FREQ_4P096_MHZ_AND_ENABLE = 0x0001
 
-STATUS_SEC_FAIL = 1 << 6
+STATUS_SEC_FAIL = 1 << 6            #status register bit 6 indicates critical SEC_FAIL error
 STATUS_READY_MASK = 0b111
 
-VOLTS_PER_CODE = 1.2 / (1 << 23)
+VOLTS_PER_CODE = 1.2 / (1 << 23)    # converts signed 24-bit ADC code to voltage (V) for AMC131M03 with 1.2V reference
 SAMPLING_RATE_HZ = 600.0
-TRIGGER_BUFFER_SIZE = 100
-AVERAGE_BLOCK_COUNT = 10
+TRIGGER_BUFFER_SIZE = 100           # rolling sample buffer size for triggered waveform capture (100 samples at 600 SPS = 0.167 seconds)
+AVERAGE_BLOCK_COUNT = 10            # number of triggered waveform blocks to average for live waveform display
 STARTUP_DISCARD_SAMPLES = 10
-PRINT_INTERVAL = 0.5
+PRINT_INTERVAL = 0.5                # seconds between console printouts of current status and voltage readings
 BASELINE_SAMPLES = 100
-RMS_CYCLES = 5
+RMS_CYCLES = 5                      # number of zero-crossing cycles to use for AC RMS calculation (5 cycles at 60 Hz = 0.083 seconds)
 PLOT_REFRESH_SECONDS = 0.1
 
 LOG_FILE = Path(__file__).resolve().parent / "log.txt"
 
-# Set logging level to ERROR so only exceptions and anomalies are recorded
+# logging level ERROR only
 logging.basicConfig(
     filename=LOG_FILE,
     filemode="a",
@@ -73,36 +75,15 @@ logging.basicConfig(
 # mathematical calculations and utility functions:
 # ==============================================================================
 
+"""Return mean-removed AC RMS for sequence of voltage samples."""
 def ac_rms_from_volts(samples):
-    """Return mean-removed AC RMS for a sequence of voltage samples."""
     if len(samples) < 2:
         return None
     mean = sum(samples) / len(samples)
     return math.sqrt(sum((value - mean) ** 2 for value in samples) / len(samples))
 
-def synchronized_rms_from_volts(samples, crossing_times, target_cycles=RMS_CYCLES):
-    """Calculate AC and total RMS over an interval bounded by positive-going zero crossings."""
-    if len(crossing_times) < target_cycles + 1:
-        return None, None
-
-    start_time = crossing_times[-target_cycles - 1]
-    end_time = crossing_times[-1]
-
-    active = [
-        voltage for timestamp, voltage in samples
-        if start_time <= timestamp <= end_time
-    ]
-
-    if len(active) < 2:
-        return None, None
-
-    mean = sum(active) / len(active)
-    ac_rms = math.sqrt(sum((value - mean) ** 2 for value in active) / len(active))
-    total_rms = math.sqrt(sum(value ** 2 for value in active) / len(active))
-    return ac_rms, total_rms
-
+"""print and log EN 50160 power quality event."""
 def report_anomaly(reason, **details):
-    """Print and log a structured EN 50160 power quality event record."""
     record = {
         "timestamp": datetime.now().astimezone().isoformat(timespec="milliseconds"),
         "event": reason,
@@ -113,23 +94,29 @@ def report_anomaly(reason, **details):
     # Log anomalies as ERROR level so they are captured in log.txt
     logging.error(message)
 
+# pack 16-bit word into 3-byte list for SPI transfer
 def word24(word16: int) -> list[int]:
     return [(word16 >> 8) & 0xFF, word16 & 0xFF, 0]
 
+# pack command frame for SPI 
 def command_frame(command: int) -> list[int]:
     return word24(command) + [0] * (FRAME_BYTES - 3)
 
+# pack write-register frame for SPI
 def wreg_frame(address: int, value: int) -> list[int]:
     command = 0x6000 | ((address & 0x3F) << 7)
     return word24(command) + word24(value) + [0] * (FRAME_BYTES - 6)
 
+# unpack signed 24-bit ADC code from 3-byte list
 def signed24(data: list[int]) -> int:
     value = (data[0] << 16) | (data[1] << 8) | data[2]
     return value - (1 << 24) if value & 0x800000 else value
 
+# unpack status register from received SPI frame
 def status_from_frame(rx: list[int]) -> int:
     return (rx[0] << 8) | rx[1]
 
+# unpack 3-channel signed 24-bit ADC codes from received SPI frame
 def channels_from_frame(rx: list[int]) -> list[int]:
     return [signed24(rx[3:6]), signed24(rx[6:9]), signed24(rx[9:12])]
 
@@ -137,23 +124,25 @@ def channels_from_frame(rx: list[int]) -> list[int]:
 # background acquisition worker thread:
 # ==============================================================================
 
+"""Poll ADC and update capture, calibration, and monitoring state."""
 def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
-    """Poll the ADC and update capture, calibration, and monitoring state."""
     try:
         def null_frame() -> list[int]:
-            return spi.xfer2(command_frame(0x0000))
+            return spi.xfer2(command_frame(0x0000)) #send null command frame to ADC, check for response
 
-        null_frame()
+        null_frame() # discard first frames after reset, as it may contain invalid data
         null_frame()
 
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + 5.0 # wait up to 5 seconds for device to become ready
         status = 0
         device_ready = False
 
+        # wait for ADC device to become ready (SEC_FAIL bit cleared)
         while not stop_event.is_set() and time.monotonic() < deadline:
             rx = null_frame()
             status = status_from_frame(rx)
 
+            # check that STATUS register is valid (bits 8-9 should be 01)
             if ((status >> 8) & 0b11) != 0b01:
                 raise RuntimeError(f"Unexpected STATUS 0x{status:04X}; check SPI wiring.")
 
@@ -162,6 +151,7 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
                 break
             time.sleep(0.001)
 
+        # if device is not ready after timeout, raise error
         if stop_event.is_set():
             return
 
@@ -170,6 +160,7 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
 
         print("ADC device ready; beginning background SPI polling.")
 
+        # initialize acquisition state variables
         discard = STARTUP_DISCARD_SAMPLES
         calibration_windows = [deque(maxlen=BASELINE_SAMPLES), deque(maxlen=BASELINE_SAMPLES)]
         baseline_rms = None
@@ -185,8 +176,9 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
         temp_triggered_times = []
         temp_triggered_vals = [[], [], []]
 
-        start_time = time.monotonic()
+        start_time = time.monotonic()   # mark start time for sample timestamps
 
+        # main acquisition loop: poll ADC, detect zero crossings, capture waveform blocks, calibrate RMS, and update shared state
         while not stop_event.is_set():
             rx = null_frame()
             status = status_from_frame(rx)
@@ -202,8 +194,9 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
 
             sample_time = time.monotonic() - start_time
             ch0_volts = volts[0]
-            is_zero_crossing = prev_voltage < 0.0 and ch0_volts >= 0.0
+            is_zero_crossing = prev_voltage < 0.0 and ch0_volts >= 0.0  # detect positive-going zero crossing on channel 0
 
+            # update frequency estimate based on zero crossings
             if is_zero_crossing:
                 if prev_crossing_time is not None:
                     period = sample_time - prev_crossing_time
@@ -212,17 +205,20 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
                         current_frequency = (0.8 * current_frequency + 0.2 * measured_freq)
                 prev_crossing_time = sample_time
 
+            # capture triggered waveform blocks
             if is_zero_crossing and not capturing_triggered:
                 capturing_triggered = True
                 capture_start_time = sample_time
                 temp_triggered_times = [0.0]
                 temp_triggered_vals = [[volts[0]], [volts[1]], [volts[2]]]
 
+            # if currently capturing a triggered block, append samples until buffer is full
             elif capturing_triggered:
                 temp_triggered_times.append(sample_time - capture_start_time)
                 for channel, value in enumerate(volts):
                     temp_triggered_vals[channel].append(value)
 
+                # once the triggered buffer is full, store it in shared state and reset capture state
                 if len(temp_triggered_times) >= TRIGGER_BUFFER_SIZE:
                     with data_lock:
                         shared_state["triggered_blocks"].append({
@@ -236,9 +232,11 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
                     temp_triggered_times = []
                     temp_triggered_vals = [[], [], []]
 
+            # update shared state with latest sample data, frequency, and zero crossing events
             prev_voltage = ch0_volts
             sample_wall_time = time.monotonic()
-
+            
+            # update shared state with latest sample data, frequency, and zero crossing events
             with data_lock:
                 shared_state["times"].append(sample_time)
                 shared_state["frequency"] = current_frequency
@@ -265,6 +263,7 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
                 while shared_state["crossings"] and sample_time - shared_state["crossings"][0] > 1.0:
                     shared_state["crossings"].popleft()
 
+            # perform baseline calibration and power quality event detection after initial discard period
             if discard:
                 discard -= 1
 
@@ -272,10 +271,12 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
                 for channel in range(2):
                     calibration_windows[channel].append(volts[channel])
 
+                # once both calibration windows are full, compute the AC RMS baseline for each channel
                 if all(len(window) == BASELINE_SAMPLES for window in calibration_windows):
                     baseline_rms = [ac_rms_from_volts(list(window)) for window in calibration_windows]
                     print(f"AC RMS baseline calibrated: CH0={baseline_rms[0]:.4f}V, CH1={baseline_rms[1]:.4f}V")
-
+            
+            # after calibration, compute AC RMS for each channel and detect power quality events based on EN 50160 criteria
             else:
                 for channel in range(2):
                     window = calibration_windows[channel]
@@ -288,6 +289,7 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
                     v_nom = baseline_rms[channel]
                     ratio = measured_rms / v_nom if v_nom > 0 else 1.0
 
+                    # determine the current power quality event based on the measured RMS ratio
                     current_event = None
                     if ratio < 0.10:
                         current_event = "INTERRUPTION"
@@ -296,6 +298,7 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
                     elif ratio > 1.10:
                         current_event = "VOLT_SWELL"
 
+                    # if the current event differs from the last recorded event for this channel, log anomaly and update the active event
                     if current_event != event_active[channel]:
                         if current_event is not None:
                             report_anomaly(
@@ -307,9 +310,11 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
                             )
                         event_active[channel] = current_event
 
+                # update shared state with latest metrics for web dashboard
                 ch0_rms_val = ac_rms_from_volts(list(calibration_windows[0])) or 0.0
                 ch1_rms_val = ac_rms_from_volts(list(calibration_windows[1])) or 0.0
 
+                # update shared state with latest metrics for web dashboard
                 with data_lock:
                     shared_state["latest_metrics"] = {
                         "frequency": current_frequency,
@@ -319,6 +324,7 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
                         "ch1_nom": baseline_rms[1] if baseline_rms else 0.0,
                     }
 
+                # periodically print current status and voltage readings to console
                 now = time.monotonic()
                 if now - last_print >= PRINT_INTERVAL:
                     print(
@@ -326,7 +332,8 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
                         f"CH0={volts[0]:+.4f}V  CH1={volts[1]:+.4f}V  CH2={volts[2]:+.4f}V"
                     )
                     last_print = now
-
+    
+    # handle any exceptions raised in the acquisition worker thread, log the error, and update shared state with the error message
     except Exception as exc:
         with data_lock:
             shared_state["worker_error"] = str(exc)
@@ -446,7 +453,7 @@ DASHBOARD_HTML = r"""
 </body>
 </html>
 """
-
+# flask routes for web dashboard and API endpoints
 @dashboard_app.route("/")
 def index():
     return render_template_string(DASHBOARD_HTML)
@@ -496,7 +503,7 @@ def run_web_server(shared_state, data_lock):
 
 
 # ==============================================================================
-# MAIN CONTROLLER (HEADLESS WEB SERVER & PLOT GENERATOR)
+# MAIN, WEB SERVER & PLOT GENERATOR
 # ==============================================================================
 
 def main() -> int:
@@ -509,6 +516,7 @@ def main() -> int:
     stop_event = Event()
     data_lock = Lock()
 
+    # shared state dictionary to hold acquisition data, metrics, and plot image bytes for web dash
     shared_state = {
         "times": deque(),
         "values": [deque(), deque(), deque()],
@@ -569,7 +577,7 @@ def main() -> int:
             daemon=True,
         )
         web_thread.start()
-        print("Web dashboard server running at http://<pi-ip-address>:5000")
+        print("Web dashboard server running at http://172.17.223.251:5000")
 
         plot_fig, plot_ax = plt.subplots(figsize=(8, 4.5))
         plot_ax.set_xlabel("Time from Trigger (s)")
@@ -592,6 +600,7 @@ def main() -> int:
 
         last_plot_update = time.monotonic()
 
+        # main loop: periodically update waveform plot and store it in shared state for web dashboard
         while not stop_event.is_set():
             now = time.monotonic()
 
