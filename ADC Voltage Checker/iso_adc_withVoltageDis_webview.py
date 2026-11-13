@@ -9,7 +9,7 @@ power quality events. live web dashboard 172.17.223.251:5000.
 
 from collections import deque
 from datetime import datetime
-from flask import Flask, jsonify, render_template_string, Response
+from flask import Flask, jsonify, render_template_string, Response, request
 from gpiozero import DigitalOutputDevice
 
 import io
@@ -18,6 +18,11 @@ import logging
 import math
 from pathlib import Path
 import signal
+import os
+import re
+import secrets
+import subprocess
+import urllib.request
 import sys
 import threading
 from threading import Event, Lock
@@ -62,6 +67,19 @@ RMS_CYCLES = 5                      # number of zero-crossing cycles to use for 
 PLOT_REFRESH_SECONDS = 0.1
 STALE_TIMEOUT_SECONDS = 2.0
 CROSSING_TIMEOUT_SECONDS = 0.5
+
+# Internet probes use HTTP so an incorrect Pi clock cannot break a TLS check.
+# Probe responses are never used as a time source; systemd-timesyncd uses NTP.
+INTERNET_CHECK_INTERVAL = 60.0
+INTERNET_PROBE_TIMEOUT = 4.0
+INTERNET_PROBES = (
+    ("http://connectivitycheck.gstatic.com/generate_204", 204, b""),
+    ("http://www.msftconnecttest.com/connecttest.txt", 200, b"Microsoft Connect Test"),
+)
+TIME_SYNC_TIMEOUT = 45.0
+TIME_SYNC_COOLDOWN = 30.0
+SYSTEMCTL = "/usr/bin/systemctl"
+TIME_SYNC_TOKEN = secrets.token_urlsafe(32)
 
 LOG_FILE = Path(__file__).resolve().parent / "log.txt"
 
@@ -398,6 +416,182 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
 
 
 # ==============================================================================
+# background internet connectivity and system clock synchronization:
+# ==============================================================================
+
+def check_internet_connection():
+    """Check known responses, rejecting redirects and typical captive portals."""
+    errors = []
+    for url, expected_status, expected_body in INTERNET_PROBES:
+        try:
+            probe = urllib.request.Request(url, headers={"User-Agent": "ADC-Dashboard/1.0"})
+            with urllib.request.urlopen(probe, timeout=INTERNET_PROBE_TIMEOUT) as response:
+                body = response.read(128)
+                if (response.geturl() == url and response.status == expected_status
+                        and body == expected_body):
+                    return True, None
+                errors.append("Unexpected response or captive portal")
+        except Exception as exc:
+            errors.append(str(exc))
+    logging.debug("Internet probe failures: %s", errors)
+    return False, (
+        "Internet check failed: neither connection-check endpoint was reachable with "
+        "the expected response. Check Wi-Fi/Ethernet, DNS, firewall/proxy settings, "
+        "or a captive portal. Date/time was not synchronized."
+    )
+
+
+def run_clock_command(arguments):
+    """Run fixed OS commands without a shell, password prompt, or unbounded wait."""
+    try:
+        result = subprocess.run(
+            arguments, capture_output=True, text=True, timeout=10,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("Required system clock command is not installed.") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("The system clock command timed out.") from exc
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()[:350]
+        raise RuntimeError(detail or "System clock command failed.")
+    return result.stdout
+
+
+def read_clock_status():
+    output = run_clock_command([
+        "timedatectl", "show", "--property=NTP", "--property=NTPSynchronized",
+    ])
+    properties = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+    if not {"NTP", "NTPSynchronized"}.issubset(properties):
+        raise RuntimeError("Could not read the Pi's NTP synchronization status.")
+    return properties
+
+
+def force_system_time_sync(stop_event):
+    """Restart timesyncd and verify a NEW NTP reply, not just an enabled service."""
+    service = run_clock_command([
+        SYSTEMCTL, "show", "systemd-timesyncd.service",
+        "--property=LoadState", "--property=ActiveState",
+    ])
+    properties = dict(line.split("=", 1) for line in service.splitlines() if "=" in line)
+    if properties.get("LoadState") != "loaded":
+        raise RuntimeError(
+            "systemd-timesyncd is unavailable. This feature requires Raspberry Pi OS "
+            "with systemd-timesyncd; no other clock service was changed."
+        )
+    if properties.get("ActiveState") != "active":
+        raise RuntimeError(
+            "systemd-timesyncd is not running. Have an administrator enable it with "
+            "'sudo timedatectl set-ntp true'. If using chrony/ntpd, keep that service "
+            "and adapt this feature instead of running two NTP services."
+        )
+    if stop_event.is_set():
+        raise RuntimeError("Time synchronization cancelled during shutdown.")
+
+    # Grant ONLY this exact restart command via sudoers; do not run Flask as root.
+    try:
+        run_clock_command([
+            "sudo", "-n", SYSTEMCTL, "restart", "systemd-timesyncd.service",
+        ])
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Cannot request an immediate NTP sync. Allow the dashboard's Linux user "
+            "to run 'sudo -n /usr/bin/systemctl restart systemd-timesyncd.service' "
+            "without a password. " + str(exc)
+        ) from exc
+
+    deadline = time.monotonic() + TIME_SYNC_TIMEOUT
+    last_error = None
+    while not stop_event.is_set() and time.monotonic() < deadline:
+        try:
+            clock = read_clock_status()
+            report = run_clock_command(["timedatectl", "timesync-status", "--no-pager"])
+            packets = re.search(r"^\s*Packet count:\s*(\d+)\s*$", report, re.MULTILINE)
+            # Restart resets timesyncd's packet counter; NTP=yes alone proves nothing.
+            if (clock["NTP"] == "yes" and clock["NTPSynchronized"] == "yes" and packets
+                    and int(packets.group(1)) > 0):
+                return
+            last_error = None
+        except RuntimeError as exc:
+            last_error = str(exc)
+        stop_event.wait(1.0)
+    if stop_event.is_set():
+        raise RuntimeError("Time synchronization cancelled during shutdown.")
+    detail = " " + last_error if last_error else ""
+    raise RuntimeError(
+        "Internet check passed, but a fresh NTP synchronization could not be "
+        "verified within 45 seconds. Check the configured NTP server and UDP port "
+        "123; web access does not guarantee NTP access." + detail
+    )
+
+
+def update_network_state(shared_state, data_lock, **changes):
+    with data_lock:
+        shared_state["network_status"].update(changes)
+
+
+def internet_time_worker(stop_event, data_lock, shared_state):
+    """Keep network and NTP waits completely outside acquisition and Flask routes."""
+    wake_event = shared_state["time_sync_request_event"]
+    force_sync = True
+    while not stop_event.is_set():
+        wake_event.clear()
+        with data_lock:
+            previous = dict(shared_state["network_status"])
+        update_network_state(
+            shared_state, data_lock, busy=True, phase="checking",
+            message="Checking the Pi's internet connection...", error=None,
+        )
+        try:
+            online, error = check_internet_connection()
+            update_network_state(
+                shared_state, data_lock, internet_connected=online,
+                last_checked=datetime.now().astimezone().isoformat(timespec="seconds"),
+            )
+            if not online:
+                raise RuntimeError(error)
+            if stop_event.is_set():
+                break
+            clock = read_clock_status()
+            synchronized = clock["NTP"] == "yes" and clock["NTPSynchronized"] == "yes"
+            update_network_state(shared_state, data_lock, ntp_synchronized=synchronized)
+            if force_sync or previous["internet_connected"] is not True or not synchronized:
+                update_network_state(
+                    shared_state, data_lock, phase="syncing",
+                    message="Internet reachable. Requesting a fresh NTP date/time sync...",
+                )
+                force_system_time_sync(stop_event)
+                update_network_state(
+                    shared_state, data_lock, ntp_synchronized=True,
+                    last_sync=datetime.now().astimezone().isoformat(timespec="seconds"),
+                )
+            update_network_state(
+                shared_state, data_lock, phase="complete", error=None,
+                message="Internet reachable. Pi date/time is synchronized by NTP.",
+            )
+        except Exception as exc:
+            message = str(exc)
+            update_network_state(
+                shared_state, data_lock, phase="error", error=message,
+                message=message, ntp_synchronized=None,
+            )
+            if message != previous.get("error"):
+                logging.error("Internet/time check: %s", message)
+        finally:
+            update_network_state(shared_state, data_lock, busy=False)
+
+        deadline = time.monotonic() + INTERNET_CHECK_INTERVAL
+        while not stop_event.is_set():
+            if wake_event.wait(min(0.25, max(0.0, deadline - time.monotonic()))):
+                force_sync = True
+                break
+            if time.monotonic() >= deadline:
+                force_sync = False
+                break
+
+
+# ==============================================================================
 # FLASK WEB DASHBOARD & LOG VIEWER SERVER
 # ==============================================================================
 
@@ -463,6 +657,13 @@ DASHBOARD_HTML = r"""
         .info-card h3 { margin-top: 0; color: var(--info-heading); font-size: 15px; border-bottom: 1px solid var(--info-border); padding-bottom: 6px; }
         .info-card ul { margin: 0; padding-left: 20px; font-size: 13px; color: var(--info-text); line-height: 1.5; }
         .info-card li { margin-bottom: 6px; }
+        .network-tools { text-align: left; }
+        .network-tools p { margin: 8px 0; font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
+        .network-tools.error { border-width: 2px; }
+        .theme-btn:disabled { opacity: 0.6; cursor: wait; }
+        #network-error-dialog { background: var(--card-bg); color: var(--text-color); border: 2px solid var(--border-color); border-radius: 8px; padding: 22px; max-width: min(500px, 85vw); }
+        #network-error-dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
+        #network-error-text { white-space: pre-wrap; overflow-wrap: anywhere; }
     </style>
 </head>
 <body>
@@ -471,6 +672,18 @@ DASHBOARD_HTML = r"""
             <h1>AMC131M03 Power Quality Dashboard</h1>
             <button class="theme-btn" id="theme-toggle" onclick="toggleTheme()">Switch to Dark Mode</button>
         </div>
+        <div class="section-box network-tools" id="network-panel">
+            <div class="metric-title">Pi Internet &amp; Date/Time</div>
+            <p id="pi-clock">Pi clock: waiting...</p>
+            <p id="network-state" role="status" aria-live="polite">Waiting for connection check...</p>
+            <p id="network-details"></p>
+            <button class="theme-btn" id="sync-time-btn" onclick="checkInternetAndSync()">Check internet &amp; sync time</button>
+        </div>
+        <dialog id="network-error-dialog" aria-labelledby="network-error-title">
+            <h2 id="network-error-title">Internet / time synchronization error</h2>
+            <p id="network-error-text"></p>
+            <button class="theme-btn" onclick="document.getElementById('network-error-dialog').close()">Dismiss</button>
+        </dialog>
         <div class="metrics-grid" id="metrics-grid">
             <div class="metric-card">
                 <div class="metric-title">Grid Frequency</div>
@@ -506,6 +719,63 @@ DASHBOARD_HTML = r"""
         </div>
     </div>
     <script>
+        const TIME_SYNC_TOKEN = {{ time_sync_token | tojson }};
+        let lastNetworkPopupError = null;
+        let syncRequestInFlight = false;
+
+        function showNetworkError(message) {
+            document.getElementById('network-error-text').innerText = message;
+            const dialog = document.getElementById('network-error-dialog');
+            if (typeof dialog.showModal === 'function') {
+                if (!dialog.open) dialog.showModal();
+            } else {
+                window.alert(message);
+            }
+        }
+
+        function updateNetworkPanel(network, piTime) {
+            if (!network) return;
+            document.getElementById('pi-clock').innerText = 'Pi clock: ' + piTime;
+            document.getElementById('network-state').innerText = network.message;
+            document.getElementById('network-panel').classList.toggle('error', Boolean(network.error));
+            document.getElementById('network-details').innerText =
+                'Last connection check (Pi time): ' + (network.last_checked || 'not checked') +
+                '\nLast verified fresh NTP sync: ' + (network.last_sync || 'not verified this run');
+            const button = document.getElementById('sync-time-btn');
+            button.disabled = network.busy || syncRequestInFlight;
+            button.innerText = network.busy ? 'Checking / syncing...' : 'Check internet & sync time';
+            if (network.error && network.error !== lastNetworkPopupError) {
+                lastNetworkPopupError = network.error;
+                showNetworkError(network.error);
+            } else if (network.phase === 'complete' && !network.error) {
+                lastNetworkPopupError = null;
+            }
+        }
+
+        async function checkInternetAndSync() {
+            if (syncRequestInFlight) return;
+            syncRequestInFlight = true;
+            lastNetworkPopupError = null;
+            const button = document.getElementById('sync-time-btn');
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 5000);
+            button.disabled = true;
+            try {
+                const response = await fetch('/api/time-sync', {
+                    method: 'POST', cache: 'no-store', signal: controller.signal,
+                    headers: {'X-Time-Sync-Token': TIME_SYNC_TOKEN}
+                });
+                const result = await response.json();
+                if (!response.ok) throw new Error(result.error || 'HTTP ' + response.status);
+                document.getElementById('network-state').innerText = result.message;
+            } catch (err) {
+                showNetworkError('Could not request a check from the Pi: ' + err.message);
+            } finally {
+                clearTimeout(timeout);
+                syncRequestInFlight = false;
+                // Status polling will re-enable the button after the worker finishes.
+            }
+        }
         function toggleTheme() {
             const html = document.documentElement;
             const btn = document.getElementById('theme-toggle');
@@ -538,6 +808,7 @@ DASHBOARD_HTML = r"""
                 });
                 if (!response.ok) throw new Error('HTTP ' + response.status);
                 const data = await response.json();
+                updateNetworkPanel(data.network, data.pi_time);
                 grid.classList.toggle('stale', data.is_stale || Boolean(data.worker_error));
 
                 document.getElementById('freq-val').innerText =
@@ -555,6 +826,8 @@ DASHBOARD_HTML = r"""
                 }
             } catch (err) {
                 grid.classList.add('stale');
+                document.getElementById('network-state').innerText =
+                    'Cannot contact the Pi dashboard. Internet status is unknown; readings may be stale.';
             } finally {
                 clearTimeout(timeout);
                 setTimeout(updateMetrics, 500);
@@ -598,7 +871,7 @@ DASHBOARD_HTML = r"""
 # flask routes for web dashboard and API endpoints
 @dashboard_app.route("/")
 def index():
-    return render_template_string(DASHBOARD_HTML)
+    return render_template_string(DASHBOARD_HTML, time_sync_token=TIME_SYNC_TOKEN)
 
 @dashboard_app.route("/api/status")
 def api_status():
@@ -610,6 +883,32 @@ def api_status():
         response.headers["Cache-Control"] = "no-store"
         return response
     return jsonify({"error": "Initializing", "is_stale": True})
+
+@dashboard_app.route("/api/time-sync", methods=["POST"])
+def api_time_sync():
+    # Token prevents cross-site requests; this LAN dashboard has no user login.
+    token = request.headers.get("X-Time-Sync-Token", "")
+    if not secrets.compare_digest(token.encode("utf-8"), TIME_SYNC_TOKEN.encode("utf-8")):
+        return jsonify({"error": "Invalid time-sync request token. Reload the dashboard."}), 403
+    if web_shared_state_ref is None:
+        return jsonify({"error": "Dashboard is initializing."}), 503
+    state = web_shared_state_ref["state"]
+    with web_shared_state_ref["lock"]:
+        if state["network_status"]["busy"] or state["time_sync_request_event"].is_set():
+            return jsonify({"error": "A connection/time check is already running."}), 409
+        now = time.monotonic()
+        previous = state["last_manual_time_sync"]
+        if previous is not None and now - previous < TIME_SYNC_COOLDOWN:
+            return jsonify({"error": "Please wait 30 seconds between manual time-sync requests."}), 429
+        state["last_manual_time_sync"] = now
+        state["network_status"].update(
+            busy=True, phase="queued", error=None, message="Connection/time check queued...",
+        )
+        state["time_sync_request_event"].set()
+    response = jsonify({"message": "Checking internet and synchronizing the Pi clock..."})
+    response.headers["Cache-Control"] = "no-store"
+    return response, 202
+
 
 @dashboard_app.route("/api/logs")
 def api_logs():
@@ -656,6 +955,18 @@ def run_web_server(shared_state, data_lock):
 
 def create_shared_state():
     return {
+        "time_sync_request_event": Event(),
+        "last_manual_time_sync": None,
+        "network_status": {
+            "busy": False,
+            "phase": "waiting",
+            "internet_connected": None,
+            "ntp_synchronized": None,
+            "last_checked": None,
+            "last_sync": None,
+            "message": "Waiting for internet/time check...",
+            "error": None,
+        },
         "times": deque(),
         "values": [deque(), deque(), deque()],
         "crossings": deque(),
@@ -681,6 +992,8 @@ def build_status_payload(state, now):
     age = now - last_sample if last_sample is not None else None
     crossing_age = now - last_crossing if last_crossing is not None else None
     payload.update({
+        "network": dict(state["network_status"]),
+        "pi_time": datetime.now().astimezone().isoformat(timespec="seconds"),
         "sample_age_s": age,
         "is_stale": age is None or age > STALE_TIMEOUT_SECONDS,
         "worker_error": state.get("worker_error"),
@@ -746,6 +1059,7 @@ def main() -> int:
     xen = None
     acquisition_thread = None
     web_thread = None
+    network_thread = None
 
     stop_event = Event()
     data_lock = Lock()
@@ -792,6 +1106,13 @@ def main() -> int:
             daemon=False,
         )
         acquisition_thread.start()
+
+        network_thread = threading.Thread(
+            target=internet_time_worker,
+            args=(stop_event, data_lock, shared_state),
+            daemon=True,
+        )
+        network_thread.start()
 
         web_thread = threading.Thread(
             target=run_web_server,
@@ -881,6 +1202,9 @@ def main() -> int:
 
     finally:
         stop_event.set()
+        shared_state["time_sync_request_event"].set()
+        if network_thread is not None:
+            network_thread.join(timeout=2.0)
         if acquisition_thread is not None and acquisition_thread.is_alive():
             acquisition_thread.join()
 
