@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# command to run dashboard in ssh terminal: python3 iso_adc_withVoltageDis_webview.py
+
 """
 Read ISO ADC 7 / AMC131M03 voltage data on Raspberry Pi SPI0.
 
@@ -20,7 +22,7 @@ from pathlib import Path
 import signal
 import os
 import re
-import secrets
+import secrets          #secure random token for time sync requests
 import subprocess
 import urllib.request
 import sys
@@ -67,6 +69,7 @@ RMS_CYCLES = 5                      # number of zero-crossing cycles to use for 
 PLOT_REFRESH_SECONDS = 0.1
 STALE_TIMEOUT_SECONDS = 2.0
 CROSSING_TIMEOUT_SECONDS = 0.5
+NOMINAL_RECALIBRATION_TIMEOUT_SECONDS = 5.0
 
 # Internet probes use HTTP so an incorrect Pi clock cannot break a TLS check.
 # Probe responses are never used as a time source; systemd-timesyncd uses NTP.
@@ -144,6 +147,11 @@ def channels_from_frame(rx: list[int]) -> list[int]:
 # background acquisition worker thread:
 # ==============================================================================
 
+def update_calibration_status(shared_state, data_lock, **changes):
+    with data_lock:
+        shared_state["calibration_status"].update(changes)
+
+
 """Poll ADC and update capture, calibration, and monitoring state."""
 def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
     try:
@@ -184,6 +192,9 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
         discard = STARTUP_DISCARD_SAMPLES
         calibration_windows = [deque(maxlen=BASELINE_SAMPLES), deque(maxlen=BASELINE_SAMPLES)]
         baseline_rms = None
+        recalibration_active = False
+        recalibration_started = None
+        recalibration_windows = [deque(maxlen=BASELINE_SAMPLES), deque(maxlen=BASELINE_SAMPLES)]
         event_active = [None, None]
         last_print = 0.0
         last_ready_warning = 0.0
@@ -206,6 +217,30 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
 
         # main acquisition loop: poll ADC, detect zero crossings, capture waveform blocks, calibrate RMS, and update shared state
         while not stop_event.is_set():
+            # Only the acquisition worker owns the nominal values and sample windows.
+            with data_lock:
+                recalibration_requested = shared_state["nominal_recalibration_requested"]
+                shared_state["nominal_recalibration_requested"] = False
+            if recalibration_requested:
+                recalibration_active = True
+                recalibration_started = time.monotonic()
+                for window in recalibration_windows:
+                    window.clear()
+                update_calibration_status(
+                    shared_state, data_lock, busy=True, phase="collecting", error=None,
+                    samples_collected=0,
+                    message="Collecting fresh CH0/CH1 samples; event detection temporarily paused.",
+                )
+            if (recalibration_active and time.monotonic() - recalibration_started
+                    >= NOMINAL_RECALIBRATION_TIMEOUT_SECONDS):
+                recalibration_active = False
+                message = "Recalibration timed out waiting for fresh samples. Previous nominal values kept."
+                with data_lock:
+                    shared_state["calibration_status"].update(
+                        busy=False, phase="error", error=message, message=message,
+                    )
+                    shared_state["latest_metrics"]["calibrated"] = baseline_rms is not None
+
             rx = null_frame()
             status = status_from_frame(rx)
 
@@ -244,6 +279,13 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
                 current_frequency = None
                 for window in calibration_windows:
                     window.clear()
+                if recalibration_active:
+                    for window in recalibration_windows:
+                        window.clear()
+                    update_calibration_status(
+                        shared_state, data_lock, samples_collected=0,
+                        message="Sample gap detected; waiting for 100 fresh consecutive samples per channel.",
+                    )
                 with data_lock:
                     shared_state["triggered_blocks"].clear()
                     shared_state["current_block"] = None
@@ -346,16 +388,53 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
 
             for channel in range(2):
                 calibration_windows[channel].append(volts[channel])
+                if recalibration_active:
+                    recalibration_windows[channel].append(volts[channel])
 
             if sample_wall_time - last_metrics_update < PLOT_REFRESH_SECONDS:
                 continue
             last_metrics_update = sample_wall_time
 
+            just_recalibrated = False
+            if recalibration_active:
+                collected = min(len(window) for window in recalibration_windows)
+                update_calibration_status(shared_state, data_lock, samples_collected=collected)
+                if collected >= BASELINE_SAMPLES:
+                    candidate = [ac_rms_from_volts(list(window)) for window in recalibration_windows]
+                    if all(value is not None and math.isfinite(value) for value in candidate):
+                        baseline_rms = candidate
+                        event_active = [None, None]
+                        recalibration_active = False
+                        just_recalibrated = True
+                        update_calibration_status(
+                            shared_state, data_lock, busy=False, phase="complete", error=None,
+                            samples_collected=BASELINE_SAMPLES,
+                            last_completed=datetime.now().astimezone().isoformat(timespec="seconds"),
+                            message="CH0/CH1 nominal values recalculated. Event detection resumed; baselines are fixed.",
+                        )
+                        print(f"AC RMS baseline recalibrated: CH0={baseline_rms[0]:.4f}V, CH1={baseline_rms[1]:.4f}V")
+                    else:
+                        recalibration_active = False
+                        message = "Invalid RMS samples. Previous nominal values kept."
+                        update_calibration_status(
+                            shared_state, data_lock, busy=False, phase="error", error=message, message=message,
+                        )
+
             if baseline_rms is None:
+                update_calibration_status(
+                    shared_state, data_lock,
+                    samples_collected=min(len(window) for window in calibration_windows),
+                )
                 if all(len(window) >= BASELINE_SAMPLES for window in calibration_windows):
                     baseline_rms = [ac_rms_from_volts(list(window)) for window in calibration_windows]
                     print(f"AC RMS baseline calibrated: CH0={baseline_rms[0]:.4f}V, CH1={baseline_rms[1]:.4f}V")
-            else:
+                    update_calibration_status(
+                        shared_state, data_lock, busy=False, phase="complete", error=None,
+                        samples_collected=BASELINE_SAMPLES,
+                        last_completed=datetime.now().astimezone().isoformat(timespec="seconds"),
+                        message="Startup calibration complete. Nominal values stay fixed until manually recalculated or restarted.",
+                    )
+            elif not recalibration_active and not just_recalibrated:
                 for channel in range(2):
                     window = calibration_windows[channel]
                     measured_rms = ac_rms_from_volts(list(window))
@@ -396,7 +475,7 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
                     "ch1_rms": ch1_rms_val,
                     "ch0_nom": baseline_rms[0] if baseline_rms else None,
                     "ch1_nom": baseline_rms[1] if baseline_rms else None,
-                    "calibrated": baseline_rms is not None,
+                    "calibrated": baseline_rms is not None and not recalibration_active,
                 }
 
             now = time.monotonic()
@@ -411,6 +490,11 @@ def adc_acquisition_worker(spi, stop_event, data_lock, shared_state):
     except Exception as exc:
         with data_lock:
             shared_state["worker_error"] = str(exc)
+            shared_state["nominal_recalibration_requested"] = False
+            shared_state["calibration_status"].update(
+                busy=False, phase="error", error=str(exc),
+                message="Acquisition error; nominal recalibration unavailable: " + str(exc),
+            )
         print(f"Error in acquisition worker: {exc}", file=sys.stderr)
         logging.exception("Acquisition worker exception")
 
@@ -700,6 +784,12 @@ DASHBOARD_HTML = r"""
                 <div class="metric-sub" id="ch1-nom">Nominal: Calibrating...</div>
             </div>
         </div>
+        <div class="section-box" style="text-align: left;">
+            <button class="theme-btn" id="recalibrate-btn" onclick="recalculateNominal()" disabled>Recalculate nominal voltage (CH0 + CH1)</button>
+            <p class="metric-sub">Use only when the expected nominal input is connected and stable. Uses 100 fresh samples per channel, not continuous recalibration.</p>
+            <p class="metric-sub" id="calibration-status" role="status" aria-live="polite">Waiting for startup calibration...</p>
+            <p class="metric-sub" id="calibration-request-error" role="alert"></p>
+        </div>
         <div class="section-box">
             <div class="metric-title" style="margin-bottom: 10px;">Live Averaged Waveform Monitor</div>
             <img id="waveform-img" src="/plot.png" alt="Live Waveform">
@@ -711,7 +801,7 @@ DASHBOARD_HTML = r"""
         <div class="info-card">
             <h3>EN 50160 Power Quality Disruption Criteria & Live Thresholds</h3>
             <ul>
-                <li><strong>Nominal Baseline (V<sub>nom</sub>):</strong> Calibrated automatically from the initial 100 samples per channel (displayed live above).</li>
+                <li><strong>Nominal Baseline (V<sub>nom</sub>):</strong> Calibrated automatically from the initial 100 samples per channel (displayed live above). Use the recalculation button after connecting a stable nominal input; the baseline does not continuously adapt.</li>
                 <li><strong>Voltage Sag (Dip):</strong> Logged when measured AC RMS drops between <strong>10% and 90%</strong> of nominal (0.10 &middot; V<sub>nom</sub> &le; V<sub>RMS</sub> &lt; 0.90 &middot; V<sub>nom</sub>).</li>
                 <li><strong>Voltage Swell:</strong> Logged when measured AC RMS rises above <strong>10%</strong> of nominal (V<sub>RMS</sub> &gt; 1.10 &middot; V<sub>nom</sub>).</li>
                 <li><strong>Voltage Interruption:</strong> Logged when measured AC RMS drops below <strong>10%</strong> of nominal (&lt; 0.10 &middot; V<sub>nom</sub>).</li>
@@ -722,6 +812,51 @@ DASHBOARD_HTML = r"""
         const TIME_SYNC_TOKEN = {{ time_sync_token | tojson }};
         let lastNetworkPopupError = null;
         let syncRequestInFlight = false;
+        let nominalRequestInFlight = false;
+
+        function updateCalibrationPanel(data) {
+            const calibration = data.calibration;
+            if (!calibration) return;
+            const button = document.getElementById('recalibrate-btn');
+            button.disabled = nominalRequestInFlight || calibration.busy || data.is_stale || Boolean(data.worker_error);
+            button.innerText = calibration.busy
+                ? 'Calibrating nominal voltage...'
+                : 'Recalculate nominal voltage (CH0 + CH1)';
+            let message = calibration.message;
+            if (calibration.busy) message += ' (' + calibration.samples_collected + '/100 samples per channel)';
+            if (data.worker_error) {
+                message = 'Acquisition error: ' + data.worker_error + '. Recalibration unavailable.';
+            } else if (data.is_stale) {
+                message += ' No fresh ADC data; recalibration unavailable.';
+            }
+            document.getElementById('calibration-status').innerText = message;
+        }
+
+        async function recalculateNominal() {
+            if (nominalRequestInFlight) return;
+            nominalRequestInFlight = true;
+            const button = document.getElementById('recalibrate-btn');
+            const errorText = document.getElementById('calibration-request-error');
+            button.disabled = true;
+            errorText.innerText = '';
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 5000);
+            try {
+                const response = await fetch('/api/recalibrate-nominal', {
+                    method: 'POST', cache: 'no-store', signal: controller.signal,
+                    headers: {'X-Dashboard-Token': TIME_SYNC_TOKEN}
+                });
+                const result = await response.json();
+                if (!response.ok) throw new Error(result.error || 'HTTP ' + response.status);
+                document.getElementById('calibration-status').innerText = result.message;
+            } catch (err) {
+                errorText.innerText = 'Could not request recalibration: ' + err.message;
+            } finally {
+                clearTimeout(timeout);
+                nominalRequestInFlight = false;
+                // Status polling restores the button when acquisition/calibration is ready.
+            }
+        }
 
         function showNetworkError(message) {
             document.getElementById('network-error-text').innerText = message;
@@ -809,6 +944,7 @@ DASHBOARD_HTML = r"""
                 if (!response.ok) throw new Error('HTTP ' + response.status);
                 const data = await response.json();
                 updateNetworkPanel(data.network, data.pi_time);
+                updateCalibrationPanel(data);
                 grid.classList.toggle('stale', data.is_stale || Boolean(data.worker_error));
 
                 document.getElementById('freq-val').innerText =
@@ -826,6 +962,9 @@ DASHBOARD_HTML = r"""
                 }
             } catch (err) {
                 grid.classList.add('stale');
+                document.getElementById('recalibrate-btn').disabled = true;
+                document.getElementById('calibration-status').innerText =
+                    'Cannot contact the Pi; recalibration status is unknown.';
                 document.getElementById('network-state').innerText =
                     'Cannot contact the Pi dashboard. Internet status is unknown; readings may be stale.';
             } finally {
@@ -856,7 +995,7 @@ DASHBOARD_HTML = r"""
                 next.id = 'waveform-img';
                 next.alt = 'Live Waveform';
                 document.getElementById('waveform-img').replaceWith(next);
-                setTimeout(refreshWaveform, 500);
+                setTimeout(refreshWaveform, 100);
             };
             next.onerror = function() {
                 setTimeout(refreshWaveform, 1000);
@@ -883,6 +1022,32 @@ def api_status():
         response.headers["Cache-Control"] = "no-store"
         return response
     return jsonify({"error": "Initializing", "is_stale": True})
+
+@dashboard_app.route("/api/recalibrate-nominal", methods=["POST"])
+def api_recalibrate_nominal():
+    token = request.headers.get("X-Dashboard-Token", "")
+    if not secrets.compare_digest(token.encode("utf-8"), TIME_SYNC_TOKEN.encode("utf-8")):
+        return jsonify({"error": "Invalid recalibration request token. Reload the dashboard."}), 403
+    if web_shared_state_ref is None:
+        return jsonify({"error": "Dashboard is initializing."}), 503
+    state = web_shared_state_ref["state"]
+    with web_shared_state_ref["lock"]:
+        if state["worker_error"]:
+            return jsonify({"error": "Acquisition has failed. Restart acquisition before recalibrating."}), 409
+        last_sample = state["last_sample_monotonic"]
+        if last_sample is None or time.monotonic() - last_sample > STALE_TIMEOUT_SECONDS:
+            return jsonify({"error": "No fresh ADC data. Previous nominal values kept."}), 409
+        if state["calibration_status"]["busy"] or state["nominal_recalibration_requested"]:
+            return jsonify({"error": "Nominal voltage calibration is already running."}), 409
+        state["nominal_recalibration_requested"] = True
+        state["calibration_status"].update(
+            busy=True, phase="queued", samples_collected=0, error=None,
+            message="Nominal recalibration queued; previous values kept until fresh samples are collected.",
+        )
+    response = jsonify({"message": "Collecting 100 fresh CH0/CH1 samples to recalculate nominal voltage..."})
+    response.headers["Cache-Control"] = "no-store"
+    return response, 202
+
 
 @dashboard_app.route("/api/time-sync", methods=["POST"])
 def api_time_sync():
@@ -955,6 +1120,15 @@ def run_web_server(shared_state, data_lock):
 
 def create_shared_state():
     return {
+        "nominal_recalibration_requested": False,
+        "calibration_status": {
+            "busy": True,
+            "phase": "startup",
+            "samples_collected": 0,
+            "last_completed": None,
+            "error": None,
+            "message": "Collecting startup nominal voltage samples...",
+        },
         "time_sync_request_event": Event(),
         "last_manual_time_sync": None,
         "network_status": {
@@ -992,6 +1166,7 @@ def build_status_payload(state, now):
     age = now - last_sample if last_sample is not None else None
     crossing_age = now - last_crossing if last_crossing is not None else None
     payload.update({
+        "calibration": dict(state["calibration_status"]),
         "network": dict(state["network_status"]),
         "pi_time": datetime.now().astimezone().isoformat(timespec="seconds"),
         "sample_age_s": age,
@@ -1168,7 +1343,10 @@ def main() -> int:
                     mode = update_waveform_plot(plot_ax, average_lines, snapshot, now)
                     plot_status.set_text(mode)
                     with io.BytesIO() as buf:
-                        plot_fig.savefig(buf, format="png", dpi=100)
+                        plot_fig.savefig(
+                            buf, format="png", dpi=80,
+                            pil_kwargs={"compress_level": 1},
+                        )
                         image_bytes = buf.getvalue()
                     with data_lock:
                         shared_state["plot_image_bytes"] = image_bytes
